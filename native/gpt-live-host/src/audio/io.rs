@@ -7,10 +7,10 @@
 //! - reference: endpoint -> engine, what was actually rendered (echo-cancellation input)
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -67,6 +67,39 @@ pub struct AudioIo {
     pub control: Arc<PlaybackControl>,
 }
 
+struct StartupThreads {
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    committed: bool,
+}
+
+impl StartupThreads {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) -> (Arc<AtomicBool>, Vec<JoinHandle<()>>) {
+        self.committed = true;
+        (Arc::clone(&self.stop), std::mem::take(&mut self.threads))
+    }
+}
+
+impl Drop for StartupThreads {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.stop.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Drop for AudioIo {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -76,11 +109,13 @@ impl Drop for AudioIo {
     }
 }
 
+#[derive(Clone)]
 pub enum InputKind {
     Device,
     File(String),
 }
 
+#[derive(Clone)]
 pub enum OutputKind {
     Device,
     None,
@@ -93,16 +128,33 @@ impl AudioIo {
     }
 
     pub fn open(input: InputKind, output: OutputKind, emitter: Emitter) -> anyhow::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
+        const MAX_ATTEMPTS: usize = 6;
+        const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::open_once(input.clone(), output.clone(), emitter.clone()) {
+                Ok(io) => return Ok(io),
+                Err(error) if is_transient_busy(&error) && attempt < MAX_ATTEMPTS => {
+                    eprintln!("audio device is busy; retrying open ({attempt}/{MAX_ATTEMPTS})");
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("audio open loop always returns on the final attempt")
+    }
+
+    fn open_once(input: InputKind, output: OutputKind, emitter: Emitter) -> anyhow::Result<Self> {
+        let mut startup = StartupThreads::new();
+        let stop = Arc::clone(&startup.stop);
         let control = Arc::new(PlaybackControl::default());
-        let mut threads = Vec::new();
 
         let (input_info, capture_prod, capture_cons) = match input {
             InputKind::Device => {
                 let (info_tx, info_rx) = mpsc::channel();
                 let stop = stop.clone();
                 let emitter = emitter.clone();
-                threads.push(
+                startup.threads.push(
                     std::thread::Builder::new()
                         .name("audio-input".into())
                         .spawn(move || run_device_input(stop, info_tx, emitter))?,
@@ -128,7 +180,7 @@ impl AudioIo {
         if let Some((reader, prod)) = capture_prod {
             let stop = stop.clone();
             let rate = input_info.rate;
-            threads.push(
+            startup.threads.push(
                 std::thread::Builder::new()
                     .name("audio-file-input".into())
                     .spawn(move || run_file_input(reader, rate, prod, stop))?,
@@ -142,7 +194,7 @@ impl AudioIo {
                 let stop = stop.clone();
                 let control = control.clone();
                 let emitter = emitter.clone();
-                threads.push(
+                startup.threads.push(
                     std::thread::Builder::new()
                         .name("audio-output".into())
                         .spawn(move || run_device_output(stop, control, info_tx, emitter))?,
@@ -168,7 +220,7 @@ impl AudioIo {
                 };
                 let stop = stop.clone();
                 let control = control.clone();
-                threads.push(
+                startup.threads.push(
                     std::thread::Builder::new()
                         .name("audio-file-output".into())
                         .spawn(move || {
@@ -186,6 +238,7 @@ impl AudioIo {
             }
         };
 
+        let (stop, threads) = startup.commit();
         Ok(Self {
             stop,
             threads,
@@ -199,6 +252,13 @@ impl AudioIo {
             control,
         })
     }
+}
+
+fn is_transient_busy(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("temporarily busy")
+        || message.contains("device or resource busy")
+        || message.contains("unable to open slave")
 }
 
 pub fn describe_defaults() -> serde_json::Value {
