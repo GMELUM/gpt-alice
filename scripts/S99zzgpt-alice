@@ -1,0 +1,38 @@
+#!/bin/sh
+APP=/data/opt/gpt-alice/gpt-alice
+PIDFILE=/run/gpt-alice.pid
+LOG=/data/opt/gpt-alice/server.log
+
+start() {
+  [ -x "$APP" ] || { echo "gpt-alice: binary missing: $APP" >&2; return 1; }
+  running=$(pidof gpt-alice 2>/dev/null || true)
+  if [ -n "$running" ]; then
+    echo "$running" > "$PIDFILE"
+    return 0
+  fi
+  "$APP" >>"$LOG" 2>&1 </dev/null &
+  echo $! > "$PIDFILE"
+  sleep 1
+  kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
+    echo "gpt-alice: failed to start; see $LOG" >&2
+    return 1
+  }
+}
+
+stop() {
+  running=$(pidof gpt-alice 2>/dev/null || true)
+  [ -n "$running" ] || { rm -f "$PIDFILE"; return 0; }
+  kill $running 2>/dev/null || return 1
+  rm -f "$PIDFILE"
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status)
+    running=$(pidof gpt-alice 2>/dev/null || true)
+    if [ -n "$running" ]; then echo "gpt-alice running: $running"; else echo "gpt-alice stopped"; fi
+    ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac

@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f5f7" />
+    <title>GPT Alice — панель управления</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #17191f;
+        background: #f4f5f7;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+        --muted: #737985;
+        --line: #e7e9ed;
+        --purple: #7657e8;
+        --purple-soft: #f0edff;
+      }
+
+      * { box-sizing: border-box; }
+      body { min-width: 320px; min-height: 100vh; margin: 0; }
+      button { font: inherit; }
+
+      .layout { display: grid; min-height: 100vh; grid-template-columns: 248px minmax(0, 1fr); }
+      .sidebar {
+        display: flex;
+        flex-direction: column;
+        gap: 36px;
+        padding: 28px 18px;
+        background: #fff;
+        border-right: 1px solid var(--line);
+      }
+      .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px; }
+      .brand-mark {
+        display: grid;
+        width: 40px;
+        height: 40px;
+        place-items: center;
+        color: #fff;
+        background: linear-gradient(145deg, #9679ff, #6746d5);
+        border-radius: 14px;
+        box-shadow: 0 6px 16px #7657e833;
+      }
+      .brand-mark svg { width: 22px; height: 22px; }
+      .brand-name { font-size: 15px; font-weight: 720; letter-spacing: -.03em; }
+      .brand-caption { margin-top: 3px; color: var(--muted); font-size: 11px; }
+      .nav-label { margin: 0 10px 10px; color: #9a9faa; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+      .nav { display: grid; gap: 5px; }
+      .nav-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 42px;
+        padding: 0 12px;
+        color: #626875;
+        font-size: 13px;
+        border-radius: 10px;
+      }
+      .nav-item.active { color: #5539c8; background: var(--purple-soft); font-weight: 650; }
+      .nav-item svg { width: 17px; height: 17px; color: currentColor; }
+      .sidebar-bottom { margin-top: auto; padding: 14px 11px 0; color: #858b96; font-size: 11px; line-height: 1.6; }
+
+      main { width: min(100%, 1120px); margin: 0 auto; padding: 36px 46px 56px; }
+      .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 38px; }
+      .eyebrow { color: var(--muted); font-size: 12px; }
+      h1 { margin: 6px 0 0; font-size: clamp(25px, 3vw, 32px); font-weight: 720; letter-spacing: -.045em; }
+      .device-pill { display: inline-flex; align-items: center; gap: 8px; padding: 9px 12px; color: #4d5360; background: #fff; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; }
+      .dot { width: 7px; height: 7px; background: #2bb673; border-radius: 50%; box-shadow: 0 0 0 3px #2bb67320; }
+
+      .welcome {
+        position: relative;
+        overflow: hidden;
+        display: flex;
+        justify-content: space-between;
+        min-height: 210px;
+        padding: 34px 38px;
+        color: #fff;
+        background: linear-gradient(112deg, #29233e 0%, #403165 57%, #6650b8 100%);
+        border-radius: 20px;
+        box-shadow: 0 15px 40px #39286c20;
+      }
+      .welcome::after { position: absolute; top: -118px; right: 5%; width: 340px; height: 340px; border: 1px solid #ffffff17; border-radius: 50%; content: ""; box-shadow: 0 0 0 36px #ffffff08, 0 0 0 72px #ffffff06; }
+      .welcome-copy { position: relative; z-index: 1; max-width: 520px; }
+      .welcome-tag { color: #d4caff; font-size: 11px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+      .welcome h2 { margin: 14px 0 9px; font-size: 25px; font-weight: 680; letter-spacing: -.035em; }
+      .welcome p { max-width: 480px; margin: 0; color: #e0dced; font-size: 13px; line-height: 1.65; }
+      .welcome-icon { position: relative; z-index: 1; align-self: center; display: grid; width: 100px; height: 100px; place-items: center; color: #e7dcff; background: #ffffff12; border: 1px solid #ffffff24; border-radius: 30px; }
+      .welcome-icon svg { width: 48px; height: 48px; }
+
+      .section-heading { display: flex; align-items: end; justify-content: space-between; margin: 34px 0 15px; }
+      .section-heading h2 { margin: 0; font-size: 17px; font-weight: 680; letter-spacing: -.025em; }
+      .section-heading span { color: var(--muted); font-size: 11px; }
+      .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+      .card { min-height: 146px; padding: 19px; background: #fff; border: 1px solid var(--line); border-radius: 15px; }
+      .card-icon { display: grid; width: 34px; height: 34px; place-items: center; color: var(--purple); background: var(--purple-soft); border-radius: 10px; }
+      .card-icon svg { width: 17px; height: 17px; }
+      .card h3 { margin: 16px 0 5px; font-size: 13px; font-weight: 660; }
+      .card p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+      .notice { display: flex; align-items: flex-start; gap: 12px; margin-top: 17px; padding: 15px 17px; color: #666178; background: #f0edff80; border: 1px solid #e5dfff; border-radius: 12px; font-size: 11px; line-height: 1.55; }
+      .notice svg { flex: 0 0 auto; width: 16px; height: 16px; color: var(--purple); }
+      .indicator-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+      .indicator-card { padding: 20px; background: #fff; border: 1px solid var(--line); border-radius: 15px; }
+      .indicator-card h3 { margin: 0 0 5px; font-size: 14px; font-weight: 680; }
+      .indicator-card p { margin: 0 0 18px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+      .control-row { display: flex; align-items: center; gap: 10px; }
+      .control-row + .control-row { margin-top: 13px; }
+      .control-row label { min-width: 70px; color: #565c68; font-size: 11px; }
+      input, select { min-height: 38px; color: #252832; background: #fff; border: 1px solid var(--line); border-radius: 9px; font: inherit; }
+      input[type="color"] { width: 52px; padding: 4px; cursor: pointer; }
+      input[type="range"] { flex: 1; min-width: 70px; accent-color: var(--purple); }
+      select { flex: 1; padding: 0 10px; }
+      output { min-width: 28px; color: #565c68; font-size: 11px; text-align: right; }
+      .button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+      .action-button { min-height: 37px; padding: 0 13px; color: #fff; background: #684bd5; border: 0; border-radius: 9px; font-size: 11px; font-weight: 650; cursor: pointer; }
+      .action-button.secondary { color: #555b68; background: #f2f3f6; }
+      .action-button:disabled { cursor: wait; opacity: .6; }
+      .indicator-status { min-height: 18px; margin-top: 13px; color: #626875; font-size: 11px; line-height: 1.5; }
+      .indicator-status.error { color: #b33c4a; }
+      .runtime-card { margin-top: 14px; padding: 20px; background: #fff; border: 1px solid var(--line); border-radius: 15px; }
+      .runtime-card h3 { margin: 0 0 8px; font-size: 14px; }
+      .runtime-card p { color: var(--muted); font-size: 11px; line-height: 1.5; }
+      .runtime-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .runtime-pill { padding: 7px 10px; color: #4d5360; background: #f4f5f7; border-radius: 999px; font-size: 11px; }
+      .runtime-output { min-height: 24px; margin-top: 10px; color: #565c68; font-size: 12px; }
+      .time-form { display: grid; grid-template-columns: minmax(170px, .7fr) minmax(260px, 1.3fr); gap: 12px; margin-top: 14px; }
+      .time-field { display: grid; gap: 7px; color: #565c68; font-size: 11px; }
+      .time-field select, .time-field input { width: 100%; padding: 0 10px; }
+      .time-current { margin-top: 14px; color: #565c68; font-size: 12px; line-height: 1.6; }
+      .time-detail { margin-top: 6px; color: var(--muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+      footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 34px; padding-top: 16px; color: #9297a1; border-top: 1px solid var(--line); font-size: 10px; }
+
+      @media (max-width: 760px) {
+        .layout { grid-template-columns: 1fr; }
+        .sidebar { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-right: 0; border-bottom: 1px solid var(--line); }
+        .brand { padding: 0; }
+        .nav-label, .sidebar-bottom { display: none; }
+        .nav { display: flex; gap: 2px; }
+        .nav-item { min-height: 38px; padding: 0 9px; }
+        .nav-item span { display: none; }
+        main { padding: 27px 20px 38px; }
+        .topbar { align-items: flex-start; gap: 14px; margin-bottom: 25px; }
+        .device-pill { padding: 8px 10px; font-size: 10px; white-space: nowrap; }
+        .welcome { min-height: 190px; padding: 26px 24px; }
+        .welcome-icon { width: 64px; height: 64px; border-radius: 21px; }
+        .welcome-icon svg { width: 34px; height: 34px; }
+        .welcome h2 { font-size: 21px; }
+        .cards { grid-template-columns: 1fr; }
+        .indicator-grid { grid-template-columns: 1fr; }
+        .time-form { grid-template-columns: 1fr; }
+        .card { min-height: 120px; }
+        .card h3 { margin-top: 12px; }
+      }
+      @media (max-width: 440px) {
+        .brand-caption { display: none; }
+        .welcome-icon { display: none; }
+        footer { flex-direction: column; gap: 5px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5c-3.7 0-6.7 3-6.7 6.7 0 2.7 1.6 5 3.9 6.1v2.2c0 .8.7 1.5 1.5 1.5h2.6c.8 0 1.5-.7 1.5-1.5v-2.2a6.7 6.7 0 0 0-2.8-12.8Z" stroke="currentColor" stroke-width="1.7"/><path d="M9.3 21h5.4M9.5 9.5c.2-1.4 1.2-2.3 2.5-2.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </div>
+          <div><div class="brand-name">GPT Alice</div><div class="brand-caption">панель устройства</div></div>
+        </div>
+        <div>
+          <div class="nav-label">Устройство</div>
+          <nav class="nav" aria-label="Разделы панели">
+            <div class="nav-item active" aria-current="page"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="4" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="14" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="14" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg><span>Обзор</span></div>
+            <div class="nav-item"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v18M7 7.5a5 5 0 0 1 10 0c0 2.1-1.2 3.2-2.5 4.3-1.2 1-2.5 2-2.5 4.2M9 20h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span>Голос</span></div>
+            <div class="nav-item"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M7 4v6m10-6v6M5 12h14v7H5z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Подключения</span></div>
+            <div class="nav-item"><svg viewBox="0 0 24 24" fill="none"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.4 15 .1.1a1.8 1.8 0 0 1-2.5 2.5l-.1-.1a1.8 1.8 0 0 0-3.1 1.3v.2a1.8 1.8 0 0 1-3.6 0v-.2a1.8 1.8 0 0 0-3.1-1.3l-.1.1a1.8 1.8 0 0 1-2.5-2.5l.1-.1a1.8 1.8 0 0 0-1.3-3.1h-.2a1.8 1.8 0 0 1 0-3.6h.2a1.8 1.8 0 0 0 1.3-3.1l-.1-.1a1.8 1.8 0 0 1 2.5-2.5l.1.1a1.8 1.8 0 0 0 3.1-1.3v-.2a1.8 1.8 0 0 1 3.6 0v.2a1.8 1.8 0 0 0 3.1 1.3l.1-.1a1.8 1.8 0 0 1 2.5 2.5l-.1.1a1.8 1.8 0 0 0 1.3 3.1h.2a1.8 1.8 0 0 1 0 3.6h-.2a1.8 1.8 0 0 0-1.3 3.1Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg><span>Система</span></div>
+          </nav>
+        </div>
+        <div class="sidebar-bottom">Локальная панель управления<br />Настройка функций появится здесь</div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div><div class="eyebrow">Панель управления</div><h1>Обзор</h1></div>
+          <div class="device-pill"><span class="dot" aria-hidden="true"></span>Веб-интерфейс доступен</div>
+        </header>
+
+        <section class="welcome" aria-labelledby="welcome-title">
+          <div class="welcome-copy">
+            <div class="welcome-tag">GPT Alice · Mini 3</div>
+            <h2 id="welcome-title">Ваша колонка, ваши правила</h2>
+            <p>Здесь будет настраиваться голосовой помощник и функции устройства. Сейчас это первый экран панели управления.</p>
+          </div>
+          <div class="welcome-icon" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7v34M16 16a8 8 0 0 1 16 0c0 3.4-2 5.1-4 6.8s-4 3.4-4 7.2M18 40h12" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></svg></div>
+        </section>
+
+        <section class="runtime-card" aria-label="Авторизация ChatGPT">
+          <h3>Авторизация ChatGPT</h3>
+          <p>Войдите в аккаунт ChatGPT через одноразовый код. Токены хранятся только на колонке в auth.json рядом с исполняемым файлом.</p>
+          <div class="runtime-row"><span class="runtime-pill" id="auth-state">Проверка авторизации…</span></div>
+          <div class="runtime-output" id="auth-code" role="status" aria-live="polite"></div>
+          <div class="button-row"><button class="action-button" id="auth-start" type="button">Подключить ChatGPT</button><button class="action-button secondary" id="auth-logout" type="button">Отключить</button></div>
+          <div class="indicator-status" id="auth-status" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="runtime-card" aria-label="Голосовой звонок GPT-Live">
+          <h3>Голосовой звонок</h3>
+          <p>Центральная кнопка запускает или завершает звонок. Пока подключение активно, микрофон передаёт звук GPT-Live, а ответ воспроизводится через динамик. Обнаружение начала и конца речи добавим отдельно.</p>
+          <div class="runtime-row"><span class="runtime-pill" id="voice-state">Звонок не запущен</span></div>
+          <div class="button-row"><button class="action-button" id="voice-toggle" type="button">Начать звонок</button></div>
+          <div class="indicator-status" id="voice-status" role="status" aria-live="polite"></div>
+          <div class="runtime-output" id="voice-log" role="log" aria-live="polite">Журнал звонка загрузится после подключения.</div>
+        </section>
+
+        <div class="section-heading"><h2>Индикаторы</h2><span>Управление кольцом и LED-часами</span></div>
+        <section class="indicator-grid" aria-label="Управление индикаторами">
+          <article class="indicator-card">
+            <h3>Световое кольцо</h3>
+            <p>Задаёт один цвет всем шести зонам кольца. Штатная служба, которая перерисовывала кольцо, остановлена.</p>
+            <div class="control-row"><label for="ring-color">Цвет</label><input id="ring-color" type="color" value="#7657e8" /><output id="ring-color-value">#7657E8</output></div>
+            <div class="button-row"><button class="action-button" id="ring-apply" type="button">Применить цвет</button><button class="action-button secondary" id="ring-restore" type="button">Восстановить начальный кадр</button></div>
+            <div class="indicator-status" id="ring-status" role="status" aria-live="polite">Подключение к колонке…</div>
+          </article>
+          <article class="indicator-card">
+            <h3>Передние часы</h3>
+            <p>Общая яркость применяется ко всем горящим сегментам часов. Ниже можно отдельно настроить выбранный сегмент: 0 гасит его, 255 задаёт максимальную яркость.</p>
+            <div class="control-row"><label for="clock-display-brightness">Общая яркость</label><input id="clock-display-brightness" type="range" min="0" max="100" value="50" /><output id="clock-display-brightness-value">50%</output></div>
+            <div class="button-row"><button class="action-button" id="clock-display-apply" type="button">Применить общую яркость</button></div>
+            <div class="control-row"><label for="clock-segment">Сегмент</label><select id="clock-segment"><option value="B3">B3</option></select></div>
+            <div class="control-row"><label for="clock-brightness">Яркость</label><input id="clock-brightness" type="range" min="0" max="255" value="66" /><output id="clock-brightness-value">66</output></div>
+            <div class="button-row"><button class="action-button" id="clock-apply" type="button">Применить яркость</button></div>
+            <div class="indicator-status" id="clock-status" role="status" aria-live="polite">Загрузка сегментов…</div>
+          </article>
+        </section>
+
+        <section class="runtime-card" aria-label="События и дисплей">
+          <h3>Событийная система</h3>
+          <p>Нажатия с GPIO-кнопок доступны приложению напрямую. Временная сцена занимает дисплей, затем управление возвращается часам. Коды кнопок сначала появятся ниже, чтобы подтвердить фактическую раскладку Mini 3.</p>
+          <div class="runtime-row"><span class="runtime-pill" id="runtime-input">Ввод: проверка…</span><span class="runtime-pill" id="runtime-mic">Микрофон: проверка…</span><span class="runtime-pill" id="runtime-scene">Сцена: —</span></div>
+          <div class="runtime-output" id="runtime-last" role="status" aria-live="polite">Нажмите кнопку громкости или центральную кнопку на колонке.</div>
+          <div class="indicator-status" id="runtime-history" aria-live="polite"></div>
+          <div class="button-row"><button class="action-button" data-face="smile" type="button">Показать улыбку · 10 с</button><button class="action-button secondary" data-face="neutral" type="button">Нейтральная · 10 с</button><button class="action-button secondary" data-face="sleep" type="button">Сонная · 10 с</button></div>
+          <div class="indicator-status" id="runtime-status" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="runtime-card" aria-label="Время и NTP">
+          <h3>Время и синхронизация</h3>
+          <p>Chrony поддерживает системное время в UTC. Выберите фиксированное смещение для часов на дисплее и NTP-серверы. Источники добавляются в chronyd; стандартный источник Яндекса удаляется из активного списка. Автоматический переход на летнее/зимнее время пока не применяется.</p>
+          <div class="time-form">
+            <label class="time-field" for="time-offset">Часовой пояс (фиксированное смещение UTC)
+              <select id="time-offset">
+                <option value="-720">UTC−12:00</option><option value="-660">UTC−11:00</option><option value="-600">UTC−10:00</option><option value="-540">UTC−09:00</option><option value="-480">UTC−08:00</option><option value="-420">UTC−07:00</option><option value="-360">UTC−06:00</option><option value="-300">UTC−05:00</option><option value="-240">UTC−04:00</option><option value="-210">UTC−03:30</option><option value="-180">UTC−03:00</option><option value="-120">UTC−02:00</option><option value="-60">UTC−01:00</option><option value="0">UTC+00:00</option><option value="60">UTC+01:00</option><option value="120">UTC+02:00</option><option value="180" selected>UTC+03:00 · Москва</option><option value="210">UTC+03:30</option><option value="240">UTC+04:00</option><option value="270">UTC+04:30</option><option value="300">UTC+05:00</option><option value="330">UTC+05:30</option><option value="345">UTC+05:45</option><option value="360">UTC+06:00</option><option value="390">UTC+06:30</option><option value="420">UTC+07:00</option><option value="480">UTC+08:00</option><option value="525">UTC+08:45</option><option value="540">UTC+09:00</option><option value="570">UTC+09:30</option><option value="600">UTC+10:00</option><option value="630">UTC+10:30</option><option value="660">UTC+11:00</option><option value="720">UTC+12:00</option><option value="765">UTC+12:45</option><option value="780">UTC+13:00</option><option value="840">UTC+14:00</option>
+              </select>
+            </label>
+            <label class="time-field" for="ntp-servers">NTP-серверы, через запятую
+              <input id="ntp-servers" type="text" value="time.cloudflare.com, time.apple.com" autocomplete="off" />
+            </label>
+          </div>
+          <div class="button-row"><button class="action-button" id="time-save" type="button">Сохранить и синхронизировать</button></div>
+          <div class="time-current" id="time-current" role="status" aria-live="polite">Загрузка времени…</div>
+          <div class="time-detail" id="time-detail"></div>
+          <div class="indicator-status" id="time-status" role="status" aria-live="polite"></div>
+        </section>
+
+        <div class="section-heading"><h2>Разделы настройки</h2><span>Будут подключаться по мере разработки</span></div>
+        <section class="cards" aria-label="Будущие разделы">
+          <article class="card"><div class="card-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v18M7 7.5a5 5 0 0 1 10 0c0 2.1-1.2 3.2-2.5 4.3-1.2 1-2.5 2-2.5 4.2M9 20h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div><h3>Голосовой помощник</h3><p>Выбор голосового движка, поведения и способа активации.</p></article>
+          <article class="card"><div class="card-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M7 4v6m10-6v6M5 12h14v7H5z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div><h3>Подключения</h3><p>Сетевые службы и внешние интеграции устройства.</p></article>
+          <article class="card"><div class="card-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.7"/><path d="M19.4 15a1.8 1.8 0 0 0 1.3-1.7v-.6a1.8 1.8 0 0 0-1.3-1.7 1.8 1.8 0 0 1-1.2-2.9 1.8 1.8 0 0 0-2.5-2.5 1.8 1.8 0 0 1-2.9-1.2 1.8 1.8 0 0 0-3.6 0 1.8 1.8 0 0 1-2.9 1.2 1.8 1.8 0 0 0-2.5 2.5 1.8 1.8 0 0 1-1.2 2.9 1.8 1.8 0 0 0 0 3.6 1.8 1.8 0 0 1 1.2 2.9 1.8 1.8 0 0 0 2.5 2.5 1.8 1.8 0 0 1 2.9 1.2 1.8 1.8 0 0 0 3.6 0 1.8 1.8 0 0 1 2.9-1.2 1.8 1.8 0 0 0 2.5-2.5 1.8 1.8 0 0 1 1.2-2.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></div><h3>Система</h3><p>Состояние колонки, обновления и базовые параметры.</p></article>
+        </section>
+
+        <div class="notice"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M12 11v5m0-8h.01" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg><span>Цвет кольца и яркость сегментов применяются сразу, но пока не сохраняются после перезапуска. Штатная обработка микрофона Яндекс сейчас отключена вместе с platformd.</span></div>
+        <footer><span>GPT Alice · локальный интерфейс</span><span>Доступен в домашней сети</span></footer>
+      </main>
+    </div>
+    <script>
+      const ringStatus = document.querySelector("#ring-status");
+      const clockStatus = document.querySelector("#clock-status");
+      const runtimeStatus = document.querySelector("#runtime-status");
+      const timeStatus = document.querySelector("#time-status");
+      const authStatus = document.querySelector("#auth-status");
+      const setStatus = (element, text, isError = false) => {
+        element.textContent = text;
+        element.classList.toggle("error", isError);
+      };
+      async function postJson(path, body) {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || `Ошибка HTTP ${response.status}`);
+        return result.message;
+      }
+
+      async function refreshAuth() {
+        const state = document.querySelector("#auth-state");
+        const code = document.querySelector("#auth-code");
+        try {
+          const response = await fetch("/api/auth/status", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(`Ошибка HTTP ${response.status}`);
+          state.textContent = data.authorized ? `ChatGPT подключён · токен до ${new Date(data.expires_at * 1000).toLocaleString()}` : data.pending ? "Ожидание подтверждения входа" : "ChatGPT не подключён";
+          code.replaceChildren();
+          if (data.pending && data.user_code) {
+            const link = document.createElement("a");
+            link.href = data.verification_url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "Открыть страницу подтверждения";
+            const value = document.createElement("strong");
+            value.textContent = `Код: ${data.user_code}`;
+            code.append(value, document.createElement("br"), link);
+          }
+          setStatus(authStatus, data.error || (data.pending ? "Введите код на странице OpenAI и подтвердите доступ." : ""), Boolean(data.error));
+        } catch (error) { setStatus(authStatus, `Не удалось получить состояние авторизации: ${error.message}`, true); }
+      }
+      document.querySelector("#auth-start").addEventListener("click", async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { setStatus(authStatus, await postJson("/api/auth/start", {})); await refreshAuth(); }
+        catch (error) { setStatus(authStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+      document.querySelector("#auth-logout").addEventListener("click", async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { setStatus(authStatus, await postJson("/api/auth/logout", {})); await refreshAuth(); }
+        catch (error) { setStatus(authStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+      refreshAuth();
+      setInterval(refreshAuth, 3000);
+
+      const voiceState = document.querySelector("#voice-state");
+      const voiceButton = document.querySelector("#voice-toggle");
+      const voiceStatus = document.querySelector("#voice-status");
+      const voiceLog = document.querySelector("#voice-log");
+      async function refreshVoice() {
+        try {
+          const response = await fetch("/api/voice", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(`Ошибка HTTP ${response.status}`);
+          voiceState.textContent = data.message;
+          voiceButton.textContent = data.state === "active" || data.call_id ? "Завершить звонок" : data.state === "connecting" ? "Подключение…" : "Начать звонок";
+          voiceButton.disabled = data.state === "connecting" || data.state === "stopping";
+          setStatus(voiceStatus, data.state === "error" ? data.message : data.call_id ? `ID звонка: ${data.call_id}` : "");
+        } catch (error) { setStatus(voiceStatus, `Не удалось получить состояние звонка: ${error.message}`, true); }
+        try {
+          const response = await fetch("/api/voice/logs", { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const entries = await response.json();
+          voiceLog.replaceChildren();
+          for (const entry of entries) {
+            const line = document.createElement("div");
+            line.textContent = `[${entry.at}] ${entry.message}`;
+            voiceLog.append(line);
+          }
+          if (!entries.length) voiceLog.textContent = "Событий пока нет.";
+          voiceLog.scrollTop = voiceLog.scrollHeight;
+        } catch (error) { voiceLog.textContent = `Не удалось загрузить журнал: ${error.message}`; }
+      }
+      voiceButton.addEventListener("click", async () => {
+        voiceButton.disabled = true;
+        try { setStatus(voiceStatus, await postJson("/api/voice/toggle", {})); }
+        catch (error) { setStatus(voiceStatus, error.message, true); }
+        await refreshVoice();
+      });
+      refreshVoice();
+      setInterval(refreshVoice, 1500);
+
+      const runtimeLast = document.querySelector("#runtime-last");
+      function describeEvent(event) {
+        if (!event) return "Нажмите кнопку громкости или центральную кнопку на колонке.";
+        if (event.type === "button") return `Кнопка: ${event.button}, ${event.action}, ${event.key_name} (${event.key_code})`;
+        if (event.type === "touch") return `Сенсор: ${event.button}, ${event.action}, ${event.key_name} (${event.key_code})`;
+        if (event.type === "scene_changed") return `Сцена дисплея: ${event.scene}`;
+        if (event.type === "microphone_mute_changed") return `Микрофоны ${event.muted ? "выключены" : "включены"} · ${event.source}`;
+        return `Событие ввода: ${event.device}: ${event.error}`;
+      }
+      async function refreshRuntime() {
+        try {
+          const response = await fetch("/api/runtime", { cache: "no-store" });
+          const data = await response.json();
+          document.querySelector("#runtime-input").textContent = `Ввод: ${data.input_devices.filter(x => x.available).length}/${data.input_devices.length} устройств`;
+          const mute = data.microphone.muted === true ? "выключены аппаратной кнопкой" : data.microphone.muted === false ? "включены" : "состояние mute неизвестно";
+          document.querySelector("#runtime-mic").textContent = `Микрофоны ${mute} · PCM ${data.microphone.available ? "доступен" : "не найден"}`;
+          document.querySelector("#runtime-scene").textContent = `Сцена: ${data.display_scene}`;
+          runtimeLast.textContent = describeEvent(data.last_event);
+          document.querySelector("#runtime-history").textContent = (data.recent_events || []).slice(-8).map(describeEvent).join(" · ");
+        } catch (error) { runtimeLast.textContent = `Не удалось получить состояние: ${error.message}`; }
+      }
+      document.querySelectorAll("[data-face]").forEach(button => button.addEventListener("click", async () => {
+        try { setStatus(runtimeStatus, await postJson("/api/display/face", { face: button.dataset.face, duration_seconds: 10 })); }
+        catch (error) { setStatus(runtimeStatus, error.message, true); }
+        refreshRuntime();
+      }));
+      refreshRuntime();
+      setInterval(refreshRuntime, 1000);
+
+      async function refreshTime() {
+        try {
+          const response = await fetch("/api/time", { cache: "no-store" });
+          const data = await response.json();
+          document.querySelector("#time-offset").value = String(data.utc_offset_minutes);
+          document.querySelector("#ntp-servers").value = data.ntp_servers.join(", ");
+          const state = data.ntp_synchronized ? "NTP синхронизирован" : "ожидается синхронизация NTP";
+          const source = (data.ntp_sources || "").split("\n").find(line => /^\^\*/.test(line.trim()))?.trim();
+          document.querySelector("#time-current").textContent = `На дисплее: ${data.local_time} · ${data.timezone_label} · ${state}${source ? ` · источник ${source.slice(2).trim()}` : ""}`;
+          document.querySelector("#time-detail").textContent = data.ntp_tracking;
+        } catch (error) {
+          document.querySelector("#time-current").textContent = `Не удалось прочитать состояние времени: ${error.message}`;
+        }
+      }
+      document.querySelector("#time-save").addEventListener("click", async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const ntp_servers = document.querySelector("#ntp-servers").value.split(",").map(value => value.trim()).filter(Boolean);
+          setStatus(timeStatus, await postJson("/api/time", {
+            utc_offset_minutes: Number(document.querySelector("#time-offset").value),
+            ntp_servers,
+          }));
+          await refreshTime();
+        } catch (error) { setStatus(timeStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+      refreshTime();
+      setInterval(refreshTime, 30000);
+
+      const ringColor = document.querySelector("#ring-color");
+      const ringColorValue = document.querySelector("#ring-color-value");
+      ringColor.addEventListener("input", () => { ringColorValue.value = ringColor.value.toUpperCase(); });
+      document.querySelector("#ring-apply").addEventListener("click", async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { setStatus(ringStatus, await postJson("/api/indicators/ring", { color: ringColor.value })); }
+        catch (error) { setStatus(ringStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+      document.querySelector("#ring-restore").addEventListener("click", async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { setStatus(ringStatus, await postJson("/api/indicators/ring/restore", {})); }
+        catch (error) { setStatus(ringStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+
+      const segmentSelect = document.querySelector("#clock-segment");
+      const brightness = document.querySelector("#clock-brightness");
+      const brightnessValue = document.querySelector("#clock-brightness-value");
+      const displayBrightness = document.querySelector("#clock-display-brightness");
+      const displayBrightnessValue = document.querySelector("#clock-display-brightness-value");
+      segmentSelect.addEventListener("change", () => {
+        const segment = segmentSelect.selectedOptions[0];
+        if (segment?.dataset.brightness) brightness.value = segment.dataset.brightness;
+        brightnessValue.value = brightness.value;
+      });
+      brightness.addEventListener("input", () => { brightnessValue.value = brightness.value; });
+      displayBrightness.addEventListener("input", () => { displayBrightnessValue.value = `${displayBrightness.value}%`; });
+      document.querySelector("#clock-display-apply").addEventListener("click", async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const message = await postJson("/api/indicators/clock/brightness", {
+            percent: Number(displayBrightness.value),
+          });
+          setStatus(clockStatus, message);
+        } catch (error) { setStatus(clockStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+      document.querySelector("#clock-apply").addEventListener("click", async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const message = await postJson("/api/indicators/clock", {
+            segment: segmentSelect.value,
+            brightness: Number(brightness.value),
+          });
+          segmentSelect.selectedOptions[0].dataset.brightness = brightness.value;
+          setStatus(clockStatus, message);
+        } catch (error) { setStatus(clockStatus, error.message, true); }
+        finally { button.disabled = false; }
+      });
+
+      fetch("/api/indicators")
+        .then((response) => { if (!response.ok) throw new Error(`Ошибка HTTP ${response.status}`); return response.json(); })
+        .then((state) => {
+          setStatus(ringStatus, state.ring_available ? `Кольцо доступно · framebuffer ${state.ring_resolution}, ${state.ring_frame_bytes} байт` : "Framebuffer кольца не найден", !state.ring_available);
+          segmentSelect.replaceChildren();
+          for (const segment of state.clock_segments) {
+            if (segment.brightness === null) continue;
+            const option = document.createElement("option");
+            option.value = segment.id;
+            option.textContent = segment.id;
+            option.dataset.brightness = segment.brightness;
+            segmentSelect.append(option);
+          }
+          if (segmentSelect.options.length === 0) {
+            setStatus(clockStatus, "Сегменты часов не найдены", true);
+            return;
+          }
+          const initial = segmentSelect.selectedOptions[0];
+          brightness.value = initial.dataset.brightness;
+          brightnessValue.value = brightness.value;
+          displayBrightness.value = Math.round(state.clock_display_brightness * 100 / 255);
+          displayBrightnessValue.value = `${displayBrightness.value}%`;
+          setStatus(clockStatus, state.platform_service_note);
+        })
+        .catch((error) => {
+          setStatus(ringStatus, `Нет связи с API индикаторов: ${error.message}`, true);
+          setStatus(clockStatus, "Сегменты часов недоступны", true);
+        });
+    </script>
+  </body>
+</html>

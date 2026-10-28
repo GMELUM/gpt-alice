@@ -1,0 +1,76 @@
+name: Build Mini 3 release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mini3-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and attach Mini 3 binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the released source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup target add aarch64-unknown-linux-musl --toolchain 1.99.1
+          rustup target add armv7-unknown-linux-gnueabihf --toolchain 1.99.1
+          rustup default 1.99.1
+
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build device binaries
+        run: ./scripts/build-mini3.sh
+
+      - name: Verify target ABIs and package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          file dist/gpt-alice dist/gpt-live-host
+          readelf -h dist/gpt-alice | grep -q 'AArch64'
+          ! readelf -l dist/gpt-alice | grep -q 'INTERP'
+          readelf -h dist/gpt-live-host | grep -q 'ARM'
+          readelf -l dist/gpt-live-host | grep -q '/lib/ld-linux-armhf.so.3'
+
+          version="$(printf '%s' "$RELEASE_TAG" | tr -c 'A-Za-z0-9._-' '_')"
+          release_dir="dist/release"
+          mkdir -p "$release_dir/package"
+          cp dist/gpt-alice "$release_dir/gpt-alice-aarch64-unknown-linux-musl"
+          cp dist/gpt-live-host "$release_dir/gpt-live-host-armv7-unknown-linux-gnueabihf"
+          cp dist/gpt-alice dist/gpt-live-host "$release_dir/package/"
+          (
+            cd "$release_dir/package"
+            sha256sum gpt-alice gpt-live-host > SHA256SUMS
+          )
+          archive="$release_dir/gpt-alice-mini3-${version}.tar.gz"
+          tar -C "$release_dir/package" -czf "$archive" gpt-alice gpt-live-host SHA256SUMS
+          (
+            cd "$release_dir"
+            sha256sum gpt-alice-aarch64-unknown-linux-musl \
+              gpt-live-host-armv7-unknown-linux-gnueabihf "$(basename "$archive")" > SHA256SUMS
+          )
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            dist/release/gpt-alice-aarch64-unknown-linux-musl \
+            dist/release/gpt-live-host-armv7-unknown-linux-gnueabihf \
+            dist/release/gpt-alice-mini3-*.tar.gz \
+            dist/release/SHA256SUMS \
+            --clobber
