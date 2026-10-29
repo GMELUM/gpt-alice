@@ -1,0 +1,6 @@
+# CPU-only synthesis environment for the pinned TeraTTSv2 ONNX release.
+numpy>=1.24,<3
+onnxruntime>=1.16
+transformers>=4.40,<5
+huggingface_hub>=0.23
+num2words>=0.5.13

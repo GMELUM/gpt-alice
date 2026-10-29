@@ -1,71 +1,22 @@
-use std::{
-    fs,
-    process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use crate::runtime::DeviceEvent;
+use crate::{mixer::AudioMixer, runtime::DeviceEvent};
 
 const ZEN_HOVER_WAV: &[u8] = include_bytes!("../assets/audio/zen-hover.wav");
-const APLAY: &str = "/usr/bin/aplay";
-const WAV_PATH: &str = "/tmp/gpt-alice-zen-hover.wav";
+const SFX_GAIN: f32 = 2.0;
+const SFX_STRETCH: f32 = 2.5;
+const SFX_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(600);
 // Keep the WAV longer than the speaker's 160 ms ALSA start buffer. The added
-// tail is silence; the audible 123 ms hover cue remains unchanged.
-const PLAYBACK_DURATION: Duration = Duration::from_millis(323);
+// tail is silence; the short hover transient is stretched to remain audible.
 
 #[derive(Clone)]
 pub struct AudioController {
-    sender: SyncSender<()>,
-    generation: Arc<AtomicU64>,
+    mixer: Arc<AudioMixer>,
 }
 
 impl AudioController {
-    pub fn new() -> Result<Self, String> {
-        fs::write(WAV_PATH, ZEN_HOVER_WAV)
-            .map_err(|error| format!("could not write embedded button WAV: {error}"))?;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let generation = Arc::new(AtomicU64::new(0));
-        let worker_generation = Arc::clone(&generation);
-
-        thread::Builder::new()
-            .name("button-audio".into())
-            .spawn(move || {
-                let mut completed_generation = 0;
-                while receiver.recv().is_ok() {
-                    loop {
-                        let current_generation = worker_generation.load(Ordering::Acquire);
-                        if current_generation <= completed_generation {
-                            break;
-                        }
-                        eprintln!("button SFX starting generation {current_generation}");
-                        match play(WAV_PATH, &worker_generation, current_generation) {
-                            Ok(Some(_)) => continue,
-                            Ok(None) => {
-                                eprintln!("button SFX generation {current_generation} finished");
-                                completed_generation = current_generation;
-                                break;
-                            }
-                            Err(error) => {
-                                eprintln!("button audio playback failed: {error}");
-                                completed_generation = current_generation;
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|error| format!("could not start audio worker: {error}"))?;
-
-        Ok(Self {
-            sender,
-            generation,
-        })
+    pub fn new(mixer: Arc<AudioMixer>) -> Self {
+        Self { mixer }
     }
 
     pub fn handle_button(&self, event: &DeviceEvent, volume_changed: bool) {
@@ -91,57 +42,106 @@ impl AudioController {
     }
 
     fn request_sfx(&self) {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        eprintln!("button SFX request generation {generation}");
-        match self.sender.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => {}
-            Err(TrySendError::Disconnected(())) => {
-                eprintln!("button audio worker is unavailable");
-            }
+        match prepare_button_wav(ZEN_HOVER_WAV, SFX_GAIN, SFX_STRETCH)
+            .and_then(|wav| self.mixer.queue_sfx(&wav))
+        {
+            Ok(()) => eprintln!("button SFX queued in shared audio mixer"),
+            Err(error) => eprintln!("button audio playback failed: {error}"),
         }
     }
 }
 
-fn play(
-    wav_path: &str,
-    generation: &AtomicU64,
-    expected_generation: u64,
-) -> Result<Option<u64>, String> {
-    let mut child = Command::new(APLAY)
-        // The device's `default` dmix PCM stays PREPARED for short WAVs and
-        // never advances its hardware pointer. Direct hardware playback was
-        // verified to enter RUNNING and advance frames on Mini 3.
-        .args(["-q", "-D", "hw:0,0", wav_path])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("could not start {APLAY}: {error}"))?;
-    let started_at = Instant::now();
-    let timeout = PLAYBACK_DURATION + Duration::from_millis(300);
-
-    loop {
-        let current_generation = generation.load(Ordering::Acquire);
-        if current_generation != expected_generation {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(Some(current_generation));
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not poll aplay: {error}"))?
-        {
-            eprintln!("aplay exited with {status}");
-            if !status.success() {
-                return Err(format!("aplay exited with {status}"));
-            }
-            return Ok(None);
-        }
-        if started_at.elapsed() >= timeout {
-            eprintln!("aplay exceeded SFX timeout; stopping process");
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(4));
+fn prepare_button_wav(input: &[u8], gain: f32, stretch: f32) -> Result<Vec<u8>, String> {
+    if input.get(0..4) != Some(b"RIFF") || input.get(8..12) != Some(b"WAVE") {
+        return Err("embedded button audio is not a RIFF/WAVE file".into());
     }
+    let output = input.to_vec();
+    let mut offset = 12;
+    let mut pcm16 = false;
+    let mut channels = 0_usize;
+    let mut sample_rate = 0_usize;
+    let mut block_align = 0_usize;
+    let mut data_range = None;
+    while offset + 8 <= output.len() {
+        let chunk_id = &output[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes(
+            output[offset + 4..offset + 8]
+                .try_into()
+                .expect("fixed-size WAV chunk header"),
+        ) as usize;
+        let start = offset + 8;
+        let end = start.saturating_add(chunk_size);
+        if end > output.len() {
+            return Err("embedded button audio has an invalid WAV chunk".into());
+        }
+        match chunk_id {
+            b"fmt " if chunk_size >= 16 => {
+                let audio_format = u16::from_le_bytes([output[start], output[start + 1]]);
+                channels = u16::from_le_bytes([output[start + 2], output[start + 3]]) as usize;
+                sample_rate =
+                    u32::from_le_bytes(output[start + 4..start + 8].try_into().unwrap()) as usize;
+                block_align = u16::from_le_bytes([output[start + 12], output[start + 13]]) as usize;
+                let bits_per_sample = u16::from_le_bytes([output[start + 14], output[start + 15]]);
+                pcm16 = audio_format == 1 && bits_per_sample == 16;
+            }
+            b"data" => data_range = Some(start..end),
+            _ => {}
+        }
+        offset = end + (chunk_size & 1);
+    }
+    if !pcm16 {
+        return Err("embedded button audio must be 16-bit PCM".into());
+    }
+    if channels == 0 || block_align != channels * 2 || sample_rate == 0 {
+        return Err("embedded button audio has invalid PCM parameters".into());
+    }
+    let range = data_range.ok_or_else(|| "embedded button audio has no data chunk".to_owned())?;
+    let source = &output[range.clone()];
+    let frames = source.len() / block_align;
+    let active_end = (0..frames)
+        .rev()
+        .find(|frame| {
+            let start = frame * block_align;
+            source[start..start + block_align]
+                .chunks_exact(2)
+                .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 128)
+        })
+        .map_or(0, |frame| frame + 1);
+    let stretched_frames = (active_end as f32 * stretch).round() as usize;
+    let mut audio = Vec::with_capacity(source.len().max(sample_rate * block_align));
+    for frame in 0..stretched_frames {
+        let position = frame as f32 / stretch;
+        let left = (position.floor() as usize).min(active_end.saturating_sub(1));
+        let right = (left + 1).min(active_end.saturating_sub(1));
+        let fraction = position - left as f32;
+        for channel in 0..channels {
+            let left_offset = left * block_align + channel * 2;
+            let right_offset = right * block_align + channel * 2;
+            let left_value = i16::from_le_bytes([source[left_offset], source[left_offset + 1]]);
+            let right_value = i16::from_le_bytes([source[right_offset], source[right_offset + 1]]);
+            let value = (f32::from(left_value) * (1.0 - fraction)
+                + f32::from(right_value) * fraction)
+                * gain;
+            let sample = value
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+            audio.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    audio.extend_from_slice(&source[active_end * block_align..]);
+    let minimum_bytes = sample_rate * block_align * SFX_MIN_DURATION.as_millis() as usize / 1000;
+    if audio.len() < minimum_bytes {
+        audio.resize(minimum_bytes, 0);
+    }
+
+    let mut prepared = Vec::with_capacity(output.len() + audio.len() - source.len());
+    prepared.extend_from_slice(&output[..range.start]);
+    prepared.extend_from_slice(&audio);
+    prepared.extend_from_slice(&output[range.end..]);
+    let data_size_offset = range.start - 4;
+    prepared[data_size_offset..data_size_offset + 4]
+        .copy_from_slice(&(audio.len() as u32).to_le_bytes());
+    let riff_size = (prepared.len() - 8) as u32;
+    prepared[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    Ok(prepared)
 }

@@ -122,8 +122,22 @@
       .runtime-card h3 { margin: 0 0 8px; font-size: 14px; }
       .runtime-card p { color: var(--muted); font-size: 11px; line-height: 1.5; }
       .runtime-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .training-link { display: inline-flex; align-items: center; min-height: 37px; margin-top: 4px; padding: 0 13px; color: #fff; background: #684bd5; border-radius: 9px; font-size: 11px; font-weight: 650; text-decoration: none; }
+      .small { margin-top: 9px !important; color: var(--muted); font-size: 10px !important; }
       .runtime-pill { padding: 7px 10px; color: #4d5360; background: #f4f5f7; border-radius: 999px; font-size: 11px; }
       .runtime-output { min-height: 24px; margin-top: 10px; color: #565c68; font-size: 12px; }
+      .silence-monitor { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding: 12px; background: #f7f6fb; border: 1px solid #eeebf8; border-radius: 11px; }
+      .silence-monitor-copy { color: #626875; font-size: 11px; line-height: 1.45; }
+      .silence-monitor-time { color: #5539c8; font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 700; }
+      .trigger-toggle { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 15px; }
+      .trigger-toggle-copy { display: grid; gap: 4px; color: #343944; font-size: 12px; font-weight: 600; }
+      .trigger-toggle-copy small { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.45; }
+      .trigger-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+      .trigger-switch { position: relative; flex: 0 0 auto; width: 42px; height: 24px; background: #d6d9df; border-radius: 999px; cursor: pointer; transition: background .18s ease; }
+      .trigger-switch::after { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 1px 3px #0002; content: ""; transition: transform .18s ease; }
+      .trigger-toggle input:checked + .trigger-switch { background: var(--purple); }
+      .trigger-toggle input:checked + .trigger-switch::after { transform: translateX(18px); }
+      .trigger-toggle input:focus-visible + .trigger-switch { outline: 3px solid #7657e855; outline-offset: 2px; }
       .time-form { display: grid; grid-template-columns: minmax(170px, .7fr) minmax(260px, 1.3fr); gap: 12px; margin-top: 14px; }
       .time-field { display: grid; gap: 7px; color: #565c68; font-size: 11px; }
       .time-field select, .time-field input { width: 100%; padding: 0 10px; }
@@ -195,6 +209,13 @@
           <div class="welcome-icon" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7v34M16 16a8 8 0 0 1 16 0c0 3.4-2 5.1-4 6.8s-4 3.4-4 7.2M18 40h12" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></svg></div>
         </section>
 
+        <section class="runtime-card" aria-label="Сбор голосовых примеров">
+          <h3>Запись своего голоса</h3>
+          <p>Собери реальные примеры «Алиса» с разной интонацией и длительностью. Записи сохраняются локально с метаданными для будущего обучения.</p>
+          <a class="training-link" href="/training">Открыть запись голоса</a>
+          <p class="small">На странице колонки запись идёт со встроенных микрофонов Mini 3 и сохраняется рядом с приложением. Открой страницу обучения, чтобы скачать WAV и его метаданные.</p>
+        </section>
+
         <section class="runtime-card" aria-label="Авторизация ChatGPT">
           <h3>Авторизация ChatGPT</h3>
           <p>Войдите в аккаунт ChatGPT через одноразовый код. Токены хранятся только на колонке в auth.json рядом с исполняемым файлом.</p>
@@ -209,8 +230,32 @@
           <p>Центральная кнопка запускает или завершает звонок. Пока подключение активно, микрофон передаёт звук GPT-Live, а ответ воспроизводится через динамик. Обнаружение начала и конца речи добавим отдельно.</p>
           <div class="runtime-row"><span class="runtime-pill" id="voice-state">Звонок не запущен</span></div>
           <div class="button-row"><button class="action-button" id="voice-toggle" type="button">Начать звонок</button></div>
+          <div class="silence-monitor" aria-live="polite">
+            <div class="silence-monitor-copy" id="silence-monitor-message">Таймер неактивен</div>
+            <div class="silence-monitor-time" id="silence-monitor-time">—:—</div>
+          </div>
+          <label class="trigger-toggle" for="trigger-call-toggle">
+            <span class="trigger-toggle-copy">Запускать звонок по слову «Алиса»<small>Если звонок уже идёт, триггер игнорируется.</small></span>
+            <input id="trigger-call-toggle" type="checkbox" role="switch" aria-describedby="trigger-status" />
+            <span class="trigger-switch" aria-hidden="true"></span>
+          </label>
+          <div class="indicator-status" id="trigger-status" role="status" aria-live="polite">Проверка детектора…</div>
           <div class="indicator-status" id="voice-status" role="status" aria-live="polite"></div>
           <div class="runtime-output" id="voice-log" role="log" aria-live="polite">Журнал звонка загрузится после подключения.</div>
+        </section>
+
+        <section class="runtime-card" aria-label="Bluetooth-колонка">
+          <h3>Bluetooth-колонка</h3>
+          <p>Включи режим сопряжения и выбери Mini 3 в Bluetooth-настройках телефона. Музыка будет играть через динамики колонки; когда GPT говорит, музыка плавно становится тише.</p>
+          <div class="runtime-row"><span class="runtime-pill" id="bluetooth-state">Проверка Bluetooth…</span></div>
+          <label class="trigger-toggle" for="bluetooth-speaker-toggle">
+            <span class="trigger-toggle-copy">Принимать Bluetooth-аудио<small>Выключение отключит Bluetooth и сопряжённые устройства.</small></span>
+            <input id="bluetooth-speaker-toggle" type="checkbox" role="switch" />
+            <span class="trigger-switch" aria-hidden="true"></span>
+          </label>
+          <div class="control-row"><label for="bluetooth-volume">Громкость музыки</label><input id="bluetooth-volume" type="range" min="0" max="100" value="88" /><output id="bluetooth-volume-value">88%</output></div>
+          <div class="button-row"><button class="action-button secondary" data-bt-action="play" type="button">Продолжить</button><button class="action-button secondary" data-bt-action="pause" type="button">Пауза</button><button class="action-button secondary" data-bt-action="previous" type="button">Назад</button><button class="action-button secondary" data-bt-action="next" type="button">Вперёд</button></div>
+          <div class="indicator-status" id="bluetooth-status" role="status" aria-live="polite"></div>
         </section>
 
         <div class="section-heading"><h2>Индикаторы</h2><span>Управление кольцом и LED-часами</span></div>
@@ -338,6 +383,25 @@
       const voiceButton = document.querySelector("#voice-toggle");
       const voiceStatus = document.querySelector("#voice-status");
       const voiceLog = document.querySelector("#voice-log");
+      const silenceMessage = document.querySelector("#silence-monitor-message");
+      const silenceTime = document.querySelector("#silence-monitor-time");
+      async function refreshSilenceMonitor() {
+        try {
+          const response = await fetch("/api/voice/silence", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(`Ошибка HTTP ${response.status}`);
+          silenceMessage.textContent = data.message;
+          if (Number.isInteger(data.remaining_seconds)) {
+            const seconds = Math.max(0, data.remaining_seconds);
+            silenceTime.textContent = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+          } else {
+            silenceTime.textContent = "—:—";
+          }
+        } catch (error) {
+          silenceMessage.textContent = `Статус таймера недоступен: ${error.message}`;
+          silenceTime.textContent = "—:—";
+        }
+      }
       async function refreshVoice() {
         try {
           const response = await fetch("/api/voice", { cache: "no-store" });
@@ -361,6 +425,7 @@
           if (!entries.length) voiceLog.textContent = "Событий пока нет.";
           voiceLog.scrollTop = voiceLog.scrollHeight;
         } catch (error) { voiceLog.textContent = `Не удалось загрузить журнал: ${error.message}`; }
+        await refreshSilenceMonitor();
       }
       voiceButton.addEventListener("click", async () => {
         voiceButton.disabled = true;
@@ -368,10 +433,71 @@
         catch (error) { setStatus(voiceStatus, error.message, true); }
         await refreshVoice();
       });
+      const triggerToggle = document.querySelector("#trigger-call-toggle");
+      const triggerStatus = document.querySelector("#trigger-status");
+      async function refreshWakeWord() {
+        try {
+          const response = await fetch("/api/wakeword", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.message || `Ошибка HTTP ${response.status}`);
+          triggerToggle.checked = data.enabled;
+          triggerToggle.disabled = !data.available;
+          setStatus(triggerStatus, data.available ? (data.enabled ? "Детектор включён · триггер запустит звонок" : "Детектор выключен") : data.message, !data.available);
+        } catch (error) {
+          triggerToggle.disabled = true;
+          setStatus(triggerStatus, `Не удалось получить настройки триггера: ${error.message}`, true);
+        }
+      }
+      triggerToggle.addEventListener("change", async () => {
+        const enabled = triggerToggle.checked;
+        triggerToggle.disabled = true;
+        try {
+          const response = await fetch("/api/wakeword", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled }),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.message || `Ошибка HTTP ${response.status}`);
+          triggerToggle.checked = data.enabled;
+          setStatus(triggerStatus, data.enabled ? "Детектор включён · триггер запустит звонок" : "Детектор выключен");
+        } catch (error) {
+          triggerToggle.checked = !enabled;
+          setStatus(triggerStatus, `Не удалось сохранить настройку: ${error.message}`, true);
+        } finally {
+          triggerToggle.disabled = false;
+        }
+      });
       refreshVoice();
+      refreshSilenceMonitor();
+      refreshWakeWord();
       setInterval(refreshVoice, 1500);
 
       const runtimeLast = document.querySelector("#runtime-last");
+      const bluetoothToggle = document.querySelector("#bluetooth-speaker-toggle");
+      const bluetoothVolume = document.querySelector("#bluetooth-volume");
+      const bluetoothVolumeValue = document.querySelector("#bluetooth-volume-value");
+      const bluetoothStatus = document.querySelector("#bluetooth-status");
+      const bluetoothState = document.querySelector("#bluetooth-state");
+      bluetoothVolume.addEventListener("input", () => { bluetoothVolumeValue.value = `${bluetoothVolume.value}%`; });
+      bluetoothVolume.addEventListener("change", async () => {
+        try { setStatus(bluetoothStatus, await postJson("/api/bluetooth/volume", { volume: Number(bluetoothVolume.value) })); }
+        catch (error) { setStatus(bluetoothStatus, error.message, true); }
+      });
+      bluetoothToggle.addEventListener("change", async () => {
+        bluetoothToggle.disabled = true;
+        try {
+          setStatus(bluetoothStatus, await postJson("/api/bluetooth/power", { enabled: bluetoothToggle.checked }));
+          await refreshRuntime();
+        } catch (error) { bluetoothToggle.checked = !bluetoothToggle.checked; setStatus(bluetoothStatus, error.message, true); }
+        finally { bluetoothToggle.disabled = false; }
+      });
+      document.querySelectorAll("[data-bt-action]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        try { setStatus(bluetoothStatus, await postJson("/api/bluetooth/playback", { action: button.dataset.btAction })); }
+        catch (error) { setStatus(bluetoothStatus, error.message, true); }
+        finally { button.disabled = false; }
+      }));
       function describeEvent(event) {
         if (!event) return "Нажмите кнопку громкости или центральную кнопку на колонке.";
         if (event.type === "button") return `Кнопка: ${event.button}, ${event.action}, ${event.key_name} (${event.key_code})`;
@@ -388,6 +514,14 @@
           const mute = data.microphone.muted === true ? "выключены аппаратной кнопкой" : data.microphone.muted === false ? "включены" : "состояние mute неизвестно";
           document.querySelector("#runtime-mic").textContent = `Микрофоны ${mute} · PCM ${data.microphone.available ? "доступен" : "не найден"}`;
           document.querySelector("#runtime-scene").textContent = `Сцена: ${data.display_scene}`;
+          const bt = data.bluetooth;
+          bluetoothToggle.checked = bt.enabled === true;
+          bluetoothToggle.disabled = !bt.available;
+          if (document.activeElement !== bluetoothVolume) {
+            bluetoothVolume.value = bt.volume;
+            bluetoothVolumeValue.value = `${bt.volume}%`;
+          }
+          bluetoothState.textContent = !bt.available ? "Bluetooth-адаптер не найден" : bt.connected ? `Подключено: ${bt.device_name || "устройство"}${bt.ducked ? " · приглушено для ответа GPT" : ""}` : bt.enabled ? "Режим сопряжения включён · выбери Mini 3 на телефоне" : "Bluetooth выключен";
           runtimeLast.textContent = describeEvent(data.last_event);
           document.querySelector("#runtime-history").textContent = (data.recent_events || []).slice(-8).map(describeEvent).join(" · ");
         } catch (error) { runtimeLast.textContent = `Не удалось получить состояние: ${error.message}`; }

@@ -164,6 +164,8 @@ struct State {
     clear_started: Option<Instant>,
     mic: Meter,
     speaker: Meter,
+    speaker_active: bool,
+    speaker_last_active: Instant,
     scratch: Vec<f32>,
 }
 
@@ -208,6 +210,8 @@ impl State {
             clear_started: None,
             mic: Meter::new(),
             speaker: Meter::new(),
+            speaker_active: false,
+            speaker_last_active: Instant::now(),
             scratch: vec![0.0; 8192],
         })
     }
@@ -290,10 +294,24 @@ impl State {
 
             if last_levels.elapsed() >= LEVEL_INTERVAL {
                 last_levels = Instant::now();
+                let speaker_level = self.speaker.take();
+                let now = Instant::now();
+                if speaker_level >= 0.10 {
+                    self.speaker_last_active = now;
+                    if !self.speaker_active {
+                        self.speaker_active = true;
+                        emitter.emit(serde_json::json!({"type":"agent_speaking","speaking":true}));
+                    }
+                } else if self.speaker_active
+                    && now.duration_since(self.speaker_last_active) >= Duration::from_millis(350)
+                {
+                    self.speaker_active = false;
+                    emitter.emit(serde_json::json!({"type":"agent_speaking","speaking":false}));
+                }
                 emitter.emit(serde_json::json!({
                     "type": "levels",
                     "mic": (self.mic.take() * 1000.0).round() / 1000.0,
-                    "speaker": (self.speaker.take() * 1000.0).round() / 1000.0,
+                    "speaker": (speaker_level * 1000.0).round() / 1000.0,
                     "muted": muted,
                 }));
             }

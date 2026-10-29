@@ -4,12 +4,11 @@
 //! (https://github.com/openai/codex, Apache-2.0): non-trickle ICE with UDP and TCP
 //! host candidates, and explicit remote candidates after the answer is applied.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-use serde_json::Value;
 use rtc::interceptor::Registry;
 use rtc::media::Sample;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpCodec;
@@ -17,6 +16,7 @@ use rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpCodingParameters;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpEncodingParameters;
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -41,6 +41,7 @@ use crate::protocol::Emitter;
 pub const OPUS_PAYLOAD_TYPE: u8 = 111;
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REMOTE_CANDIDATES: usize = 32;
+const MAX_PENDING_AUDIO_FRAMES: usize = 3000;
 
 /// An RTP packet from the remote audio track.
 pub struct IncomingPacket {
@@ -88,12 +89,32 @@ impl PeerConnectionEventHandler for Events {
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let incoming = self.incoming.clone();
+        let emitter = self.emitter.clone();
+        emitter.emit(serde_json::json!({"type": "remote_track", "state": "opened"}));
         tokio::spawn(async move {
+            let mut received = 0u64;
+            let mut last_payload_type = None;
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(packet) => {
+                        received = received.saturating_add(1);
+                        let payload_type = packet.header.payload_type;
+                        if last_payload_type != Some(payload_type) {
+                            last_payload_type = Some(payload_type);
+                            emitter.emit(serde_json::json!({
+                                "type": "remote_rtp",
+                                "packets": received,
+                                "payload_type": payload_type,
+                            }));
+                        }
                         if packet.header.payload_type != OPUS_PAYLOAD_TYPE {
                             continue;
+                        }
+                        if received == 1 || received.is_multiple_of(500) {
+                            emitter.emit(serde_json::json!({
+                                "type": "remote_rtp_progress",
+                                "packets": received,
+                            }));
                         }
                         // Drop rather than block when the audio engine falls behind.
                         let _ = incoming.try_send(IncomingPacket {
@@ -101,7 +122,14 @@ impl PeerConnectionEventHandler for Events {
                             payload: packet.payload.to_vec(),
                         });
                     }
-                    TrackRemoteEvent::OnEnded => break,
+                    TrackRemoteEvent::OnEnded => {
+                        emitter.emit(serde_json::json!({
+                            "type": "remote_track",
+                            "state": "ended",
+                            "packets": received,
+                        }));
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -224,17 +252,52 @@ impl Transport {
             ready_tx.send_replace(false);
         });
 
+        let mut sender_ready = ready.clone();
+        let sender_emitter = emitter.clone();
         let sender = tokio::spawn(async move {
-            while let Some(frame) = outgoing.recv().await {
-                let sample = Sample {
-                    data: frame.data.into(),
-                    duration: Duration::from_millis(20),
-                    ..Default::default()
-                };
-                let write = track.write_sample(ssrc, OPUS_PAYLOAD_TYPE, &sample, &[]);
-                if timeout(Duration::from_millis(200), write).await.is_err() {
-                    // A stalled write means the peer is gone; keep draining so the engine never blocks.
-                    continue;
+            let mut pending = VecDeque::new();
+            let mut dropped = 0usize;
+            loop {
+                tokio::select! {
+                    frame = outgoing.recv() => {
+                        let Some(frame) = frame else { break };
+                        if *sender_ready.borrow() {
+                            if !pending.is_empty() {
+                                sender_emitter.emit(serde_json::json!({
+                                    "type": "audio_context_replay",
+                                    "frames": pending.len(),
+                                    "dropped_frames": dropped,
+                                }));
+                                while let Some(buffered) = pending.pop_front() {
+                                    write_audio_frame(&track, ssrc, buffered).await;
+                                }
+                                dropped = 0;
+                            }
+                            write_audio_frame(&track, ssrc, frame).await;
+                        } else {
+                            if pending.len() == MAX_PENDING_AUDIO_FRAMES {
+                                pending.pop_front();
+                                dropped = dropped.saturating_add(1);
+                            }
+                            pending.push_back(frame);
+                        }
+                    }
+                    changed = sender_ready.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *sender_ready.borrow() && !pending.is_empty() {
+                            sender_emitter.emit(serde_json::json!({
+                                "type": "audio_context_replay",
+                                "frames": pending.len(),
+                                "dropped_frames": dropped,
+                            }));
+                            while let Some(frame) = pending.pop_front() {
+                                write_audio_frame(&track, ssrc, frame).await;
+                            }
+                            dropped = 0;
+                        }
+                    }
                 }
             }
         });
@@ -323,5 +386,17 @@ impl Transport {
         self.sender.abort();
         self.event_sender.abort();
         let _ = timeout(Duration::from_secs(2), self.connection.close()).await;
+    }
+}
+
+async fn write_audio_frame(track: &TrackLocalStaticSample, ssrc: u32, frame: OutgoingFrame) {
+    let sample = Sample {
+        data: frame.data.into(),
+        duration: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let write = track.write_sample(ssrc, OPUS_PAYLOAD_TYPE, &sample, &[]);
+    if let Err(error) = timeout(Duration::from_millis(200), write).await {
+        eprintln!("gpt-live-host: outbound audio write stalled: {error}");
     }
 }

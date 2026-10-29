@@ -1,0 +1,7 @@
+[package]
+name = "gpt-alice-audio-sink"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+alsa = "0.11"

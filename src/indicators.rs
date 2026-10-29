@@ -30,7 +30,8 @@ pub struct IndicatorController {
 #[derive(Clone, Copy)]
 enum DisplayState {
     Clock,
-    Volume(u8),
+    Volume,
+    Timer,
     Face,
 }
 
@@ -264,6 +265,8 @@ impl IndicatorController {
                 }
             }
         }
+        lit.push(("DH".to_owned(), brightness));
+        lit.push(("DL".to_owned(), brightness));
         let lit: Vec<(&'static str, u8)> = lit
             .into_iter()
             .filter_map(|(id, b)| {
@@ -301,7 +304,39 @@ impl IndicatorController {
             .display
             .lock()
             .map_err(|_| "Не удалось получить состояние дисплея".to_owned())? =
-            DisplayState::Volume(volume);
+            DisplayState::Volume;
+        Ok(())
+    }
+
+    pub fn render_timer_countdown(&self, seconds: u64) -> Result<(), String> {
+        let brightness = self
+            .clock_brightness
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(150);
+        let seconds = seconds.min(99 * 60 + 59);
+        let digits = [
+            seconds / 60 / 10,
+            seconds / 60 % 10,
+            seconds % 60 / 10,
+            seconds % 10,
+        ];
+        let mut lit = Vec::new();
+        for (position, digit) in digits.into_iter().enumerate() {
+            for segment in digit_segments(digit as usize) {
+                let id = format!("{segment}{position}");
+                if let Some(id) = CLOCK_SEGMENTS.iter().find(|known| **known == id) {
+                    lit.push((*id, brightness));
+                }
+            }
+        }
+        lit.push(("DH", brightness));
+        lit.push(("DL", brightness));
+        self.render_face(lit)?;
+        *self
+            .display
+            .lock()
+            .map_err(|_| "Не удалось получить состояние дисплея".to_owned())? = DisplayState::Timer;
         Ok(())
     }
 
@@ -312,8 +347,7 @@ impl IndicatorController {
             .map_err(|_| "Не удалось получить состояние дисплея".to_owned())?;
         match display {
             DisplayState::Clock => self.render_idle_clock(utc_offset_minutes),
-            DisplayState::Volume(volume) => self.render_volume(volume),
-            DisplayState::Face => Ok(()),
+            DisplayState::Volume | DisplayState::Timer | DisplayState::Face => Ok(()),
         }
     }
 

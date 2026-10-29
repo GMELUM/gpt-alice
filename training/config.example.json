@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "wake_phrase": "Алиса",
+  "sample_rate_hz": 16000,
+  "channels": 1,
+  "sample_format": "pcm_s16le",
+  "positive_phrases_file": "phrases/positive.txt",
+  "hard_negative_phrases_file": "phrases/hard-negatives.txt",
+  "stress_only_phrases_file": "phrases/stress-only.txt",
+  "voices": [
+    "piper:ru_RU-denis-medium",
+    "piper:ru_RU-dmitri-medium",
+    "say:Milena",
+    "teratts:ru_f1",
+    "teratts:ru_f2",
+    "teratts:ru_m1",
+    "teratts:ru_m5"
+  ],
+  "voice_groups": {
+    "piper:ru_RU-denis-medium": "adult_male_synthetic",
+    "piper:ru_RU-dmitri-medium": "adult_male_synthetic",
+    "say:Milena": "adult_female_system_tts",
+    "teratts:ru_f1": "adult_female_neural_tts",
+    "teratts:ru_f2": "adult_female_neural_tts",
+    "teratts:ru_m1": "adult_male_neural_tts",
+    "teratts:ru_m5": "adult_male_neural_tts"
+  },
+  "speaking_rates": [0.72, 0.86, 1.0, 1.15, 1.3],
+  "seeds_per_variant": 3,
+  "seeds_per_voice": {
+    "say:Milena": 1,
+    "teratts:ru_f1": 1,
+    "teratts:ru_f2": 1,
+    "teratts:ru_m1": 1,
+    "teratts:ru_m5": 1
+  },
+  "contexts_file": "phrases/positive-contexts.txt",
+  "output_dir": "corpus/synthetic",
+  "augmentation": {
+    "background_categories": [
+      "music",
+      "city_rain_traffic",
+      "rain_thunder",
+      "wind"
+    ],
+    "snr_db": [-5, 0, 5, 10, 20]
+  },
+  "split": {
+    "train": 0.8,
+    "validation": 0.1,
+    "test": 0.1,
+    "group_by": ["speaker_id", "source_recording_id"],
+    "freeze_test_after_creation": true
+  }
+}

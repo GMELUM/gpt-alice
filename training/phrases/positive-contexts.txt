@@ -1,0 +1,8 @@
+# The wake word appears in different positions and natural sentence contexts.
+Эй, Алиса!
+Слушай, Алиса.
+Алиса, привет!
+Алиса, который час?
+Скажи, Алиса, какая погода?
+Алиса, включи свет.
+Можно тебя спросить, Алиса?

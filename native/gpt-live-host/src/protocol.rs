@@ -50,17 +50,18 @@ pub enum InputSpec {
     },
 }
 
-/// Speaker sink: the default output device, "none" (discard), or a WAV file.
-#[derive(Debug, Default, Deserialize)]
+/// Speaker sink: the centralized application mixer, "none", or a WAV file.
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum OutputSpec {
-    #[default]
-    #[serde(skip)]
-    Device,
     Named(String),
-    File {
-        file: String,
-    },
+    File { file: String },
+}
+
+impl Default for OutputSpec {
+    fn default() -> Self {
+        Self::Named("broker".into())
+    }
 }
 
 /// Writes one JSON object per line to stdout. Cloneable and thread-safe.

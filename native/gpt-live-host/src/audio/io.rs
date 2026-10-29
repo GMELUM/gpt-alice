@@ -117,16 +117,12 @@ pub enum InputKind {
 
 #[derive(Clone)]
 pub enum OutputKind {
-    Device,
+    Broker,
     None,
     File(String),
 }
 
 impl AudioIo {
-    pub fn queue_sfx(&self, samples: &[f32]) {
-        self.control.queue_sfx(samples);
-    }
-
     pub fn open(input: InputKind, output: OutputKind, emitter: Emitter) -> anyhow::Result<Self> {
         const MAX_ATTEMPTS: usize = 6;
         const RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -189,19 +185,25 @@ impl AudioIo {
         let capture = capture_cons.ok_or_else(|| anyhow::anyhow!("no capture ring"))?;
 
         let (output_info, playback, reference) = match output {
-            OutputKind::Device => {
-                let (info_tx, info_rx) = mpsc::channel();
+            OutputKind::Broker => {
+                let rate = 48_000;
+                let (playback_prod, playback_cons) = HeapRb::<f32>::new(rate as usize * 4).split();
+                let (reference_prod, reference_cons) = HeapRb::<f32>::new(rate as usize).split();
+                let info = EndpointInfo {
+                    name: "shared-audio-mixer".into(),
+                    rate,
+                    channels: 1,
+                };
                 let stop = stop.clone();
                 let control = control.clone();
-                let emitter = emitter.clone();
                 startup.threads.push(
                     std::thread::Builder::new()
-                        .name("audio-output".into())
-                        .spawn(move || run_device_output(stop, control, info_tx, emitter))?,
+                        .name("shared-audio-output-client".into())
+                        .spawn(move || {
+                            run_broker_output(playback_cons, reference_prod, control, stop)
+                        })?,
                 );
-                info_rx
-                    .recv_timeout(Duration::from_secs(10))
-                    .map_err(|_| anyhow::anyhow!("speaker did not start"))??
+                (info, playback_prod, reference_cons)
             }
             OutputKind::None | OutputKind::File(_) => {
                 let rate = 48_000;
@@ -254,6 +256,47 @@ impl AudioIo {
     }
 }
 
+fn run_broker_output(
+    playback: HeapCons<f32>,
+    reference: HeapProd<f32>,
+    control: Arc<PlaybackControl>,
+    stop: Arc<AtomicBool>,
+) {
+    let socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("shared audio broker socket failed: {error}");
+            return;
+        }
+    };
+    if let Err(error) = socket.connect("127.0.0.1:19874") {
+        eprintln!("shared audio broker connection failed: {error}");
+        return;
+    }
+    let mut renderer = Renderer::new(playback, reference, control, 48_000);
+    let mut chunk = vec![0.0f32; 480];
+    let mut packet = vec![0u8; 1 + chunk.len() * 4];
+    packet[0] = 1; // GPT-Live source.
+    let started = Instant::now();
+    let mut rendered = 0u64;
+    while !stop.load(Ordering::Acquire) {
+        let due = started + Duration::from_millis(rendered * 10);
+        let now = Instant::now();
+        if due > now {
+            std::thread::sleep(due - now);
+        }
+        renderer.render(&mut chunk);
+        for (sample, bytes) in chunk.iter().zip(packet[1..].chunks_exact_mut(4)) {
+            bytes.copy_from_slice(&sample.to_le_bytes());
+        }
+        if let Err(error) = socket.send(&packet) {
+            eprintln!("shared audio broker write failed: {error}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        rendered += 1;
+    }
+}
+
 fn is_transient_busy(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("temporarily busy")
@@ -294,7 +337,6 @@ pub fn describe_defaults() -> serde_json::Value {
 }
 
 type InputReady = anyhow::Result<(EndpointInfo, HeapCons<f32>)>;
-type OutputReady = anyhow::Result<(EndpointInfo, HeapProd<f32>, HeapCons<f32>)>;
 
 fn device_name(device: &cpal::Device) -> String {
     device
@@ -460,96 +502,6 @@ impl Renderer {
         }
         self.reference.push_slice(out);
     }
-}
-
-fn run_device_output(
-    stop: Arc<AtomicBool>,
-    control: Arc<PlaybackControl>,
-    ready: mpsc::Sender<OutputReady>,
-    emitter: Emitter,
-) {
-    let result =
-        (|| -> anyhow::Result<(cpal::Stream, EndpointInfo, HeapProd<f32>, HeapCons<f32>)> {
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .ok_or_else(|| anyhow::anyhow!("no speaker found"))?;
-            let supported = device.default_output_config()?;
-            let config = supported.config();
-            let channels = config.channels as usize;
-            let rate = config.sample_rate;
-            let (playback_prod, playback_cons) = HeapRb::<f32>::new(rate as usize * 4).split();
-            let (reference_prod, reference_cons) = HeapRb::<f32>::new(rate as usize).split();
-            let renderer = Renderer::new(playback_cons, reference_prod, control, rate);
-            let errors = stream_error(emitter.clone(), "speaker");
-            let stream = match supported.sample_format() {
-                cpal::SampleFormat::F32 => {
-                    build_output::<f32>(&device, config, channels, renderer, errors)
-                }
-                cpal::SampleFormat::I16 => {
-                    build_output::<i16>(&device, config, channels, renderer, errors)
-                }
-                cpal::SampleFormat::I32 => {
-                    build_output::<i32>(&device, config, channels, renderer, errors)
-                }
-                cpal::SampleFormat::U16 => {
-                    build_output::<u16>(&device, config, channels, renderer, errors)
-                }
-                cpal::SampleFormat::U8 => {
-                    build_output::<u8>(&device, config, channels, renderer, errors)
-                }
-                cpal::SampleFormat::F64 => {
-                    build_output::<f64>(&device, config, channels, renderer, errors)
-                }
-                other => anyhow::bail!("unsupported speaker sample format {other}"),
-            }?;
-            stream.play()?;
-            let info = EndpointInfo {
-                name: device_name(&device),
-                rate,
-                channels: channels as u16,
-            };
-            Ok((stream, info, playback_prod, reference_cons))
-        })();
-    match result {
-        Ok((stream, info, playback, reference)) => {
-            let _ = ready.send(Ok((info, playback, reference)));
-            while !stop.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            drop(stream);
-        }
-        Err(error) => {
-            let _ = ready.send(Err(error));
-        }
-    }
-}
-
-fn build_output<T>(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    channels: usize,
-    mut renderer: Renderer,
-    errors: impl FnMut(cpal::Error) + Send + 'static,
-) -> anyhow::Result<cpal::Stream>
-where
-    T: SizedSample + FromSample<f32> + Send + 'static,
-{
-    let mut mono = Vec::<f32>::with_capacity(4096);
-    Ok(device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let frames = data.len() / channels.max(1);
-            mono.resize(frames, 0.0);
-            renderer.render(&mut mono);
-            for (frame, sample) in data.chunks_mut(channels.max(1)).zip(&mono) {
-                let value = T::from_sample(sample.clamp(-1.0, 1.0));
-                frame.fill(value);
-            }
-        },
-        errors,
-        None,
-    )?)
 }
 
 fn run_file_input(

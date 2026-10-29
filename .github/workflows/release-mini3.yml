@@ -39,28 +39,37 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          file dist/gpt-alice dist/gpt-live-host
+          file dist/gpt-alice dist/gpt-live-host dist/audio-sink
           readelf -h dist/gpt-alice | grep -q 'AArch64'
           ! readelf -l dist/gpt-alice | grep -q 'INTERP'
           readelf -h dist/gpt-live-host | grep -q 'ARM'
           readelf -l dist/gpt-live-host | grep -q '/lib/ld-linux-armhf.so.3'
+          readelf -h dist/audio-sink | grep -q 'ARM'
+          readelf -l dist/audio-sink | grep -q '/lib/ld-linux-armhf.so.3'
 
           version="$(printf '%s' "$RELEASE_TAG" | tr -c 'A-Za-z0-9._-' '_')"
           release_dir="dist/release"
           mkdir -p "$release_dir/package"
           cp dist/gpt-alice "$release_dir/gpt-alice-aarch64-unknown-linux-musl"
           cp dist/gpt-live-host "$release_dir/gpt-live-host-armv7-unknown-linux-gnueabihf"
-          cp dist/gpt-alice dist/gpt-live-host "$release_dir/package/"
+          cp dist/audio-sink "$release_dir/audio-sink-armv7-unknown-linux-gnueabihf"
+          cp dist/gpt-alice dist/gpt-live-host dist/audio-sink "$release_dir/package/"
+          cp -R dist/wakeword "$release_dir/package/wakeword"
+          mkdir -p "$release_dir/package/licenses"
+          cp native/gpt-live-host/LICENSE.opencode-gpt-live assets/audio/LICENSE-uisfx-audio.txt "$release_dir/package/licenses/"
+          cp assets/wakeword/README.md "$release_dir/package/wakeword/README.md"
+          cp README.md CHANGELOG.md "$release_dir/package/"
           (
             cd "$release_dir/package"
-            sha256sum gpt-alice gpt-live-host > SHA256SUMS
+            sha256sum gpt-alice gpt-live-host audio-sink wakeword/*.onnx wakeword/settings.json wakeword/README.md licenses/* README.md CHANGELOG.md > SHA256SUMS
           )
           archive="$release_dir/gpt-alice-mini3-${version}.tar.gz"
-          tar -C "$release_dir/package" -czf "$archive" gpt-alice gpt-live-host SHA256SUMS
+          tar -C "$release_dir/package" -czf "$archive" gpt-alice gpt-live-host audio-sink wakeword licenses README.md CHANGELOG.md SHA256SUMS
           (
             cd "$release_dir"
             sha256sum gpt-alice-aarch64-unknown-linux-musl \
-              gpt-live-host-armv7-unknown-linux-gnueabihf "$(basename "$archive")" > SHA256SUMS
+              gpt-live-host-armv7-unknown-linux-gnueabihf \
+              audio-sink-armv7-unknown-linux-gnueabihf "$(basename "$archive")" > SHA256SUMS
           )
 
       - name: Upload release assets
@@ -71,6 +80,7 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             dist/release/gpt-alice-aarch64-unknown-linux-musl \
             dist/release/gpt-live-host-armv7-unknown-linux-gnueabihf \
+            dist/release/audio-sink-armv7-unknown-linux-gnueabihf \
             dist/release/gpt-alice-mini3-*.tar.gz \
             dist/release/SHA256SUMS \
             --clobber

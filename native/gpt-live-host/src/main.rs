@@ -7,6 +7,7 @@ mod audio;
 mod duck;
 mod protocol;
 mod transport;
+mod wakeword;
 
 use std::io::{BufRead, Cursor};
 use std::sync::mpsc as std_mpsc;
@@ -69,6 +70,25 @@ fn main() {
         }
         Some("--devices") => {
             println!("{}", audio::io::describe_defaults());
+            return;
+        }
+        Some("--wakeword") => {
+            let Some(directory) = args.next() else {
+                eprintln!("usage: gpt-live-host --wakeword <model-directory> [threshold]");
+                std::process::exit(2);
+            };
+            let threshold = args
+                .next()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.80);
+            if !(0.0..=1.0).contains(&threshold) {
+                eprintln!("wake-word threshold must be between 0 and 1");
+                std::process::exit(2);
+            }
+            if let Err(error) = run_wakeword(std::path::Path::new(&directory), threshold) {
+                Emitter::new().error(format!("wake-word detector stopped: {error:#}"), true);
+                std::process::exit(1);
+            }
             return;
         }
         Some(other) => {
@@ -138,21 +158,60 @@ fn main() {
     emitter.emit(serde_json::json!({ "type": "closed" }));
 }
 
+fn run_wakeword(directory: &std::path::Path, threshold: f32) -> anyhow::Result<()> {
+    use ringbuf::traits::Consumer;
+    use std::time::{Duration, Instant};
+
+    let emitter = Emitter::new();
+    let mut detector = wakeword::WakeWordModel::load(directory)?;
+    let mut io = AudioIo::open(InputKind::Device, OutputKind::None, emitter.clone())?;
+    let rings = io
+        .rings
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("microphone ring is missing"))?;
+    let mut resampler = audio::resample::Converter::new_bounded(io.input.rate, 16_000, 32_000)?;
+    let mut input = vec![0.0f32; 8192];
+    let mut block = [0.0f32; 1280];
+    let mut above_threshold = 0usize;
+    let mut last_trigger = Instant::now() - Duration::from_secs(10);
+    emitter.emit(serde_json::json!({
+        "type": "wakeword_ready",
+        "input": {"name": io.input.name, "rate": io.input.rate, "channels": io.input.channels},
+        "threshold": threshold,
+        "model": directory.display().to_string()
+    }));
+
+    loop {
+        let read = rings.capture.pop_slice(&mut input);
+        if read == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        resampler.push(&input[..read])?;
+        while resampler.take_exact(&mut block) {
+            for score in detector.push_audio(&block)? {
+                if score >= threshold {
+                    above_threshold = above_threshold.saturating_add(1);
+                } else {
+                    above_threshold = 0;
+                }
+                if above_threshold >= 3 && last_trigger.elapsed() >= Duration::from_secs(5) {
+                    last_trigger = Instant::now();
+                    above_threshold = 0;
+                    emitter.emit(serde_json::json!({"type": "wakeword_detected", "phrase": "Алиса", "score": score}));
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Session {
     transport: Option<Transport>,
-    pending: Option<Pending>,
     engine: Option<Engine>,
     muted: bool,
     /// Other apps' audio lowered for the call, restored when dropped.
     ducking: Option<duck::Ducking>,
-}
-
-/// Resources created by `start` and consumed once the answer connects.
-struct Pending {
-    io: AudioIo,
-    incoming: std_mpsc::Receiver<transport::IncomingPacket>,
-    outgoing: tokio::sync::mpsc::Sender<transport::OutgoingFrame>,
 }
 
 impl Session {
@@ -181,7 +240,7 @@ impl Session {
                 let output = match output {
                     OutputSpec::File { file } => OutputKind::File(file),
                     OutputSpec::Named(name) if name == "none" => OutputKind::None,
-                    OutputSpec::Named(_) | OutputSpec::Device => OutputKind::Device,
+                    OutputSpec::Named(_) => OutputKind::Broker,
                 };
                 // Open devices first so permission prompts and missing hardware fail fast.
                 let io = AudioIo::open(input, output, emitter.clone())?;
@@ -191,16 +250,24 @@ impl Session {
                     "output": { "name": io.output.name, "rate": io.output.rate, "channels": io.output.channels },
                 }));
                 let (incoming_tx, incoming_rx) = std_mpsc::sync_channel(256);
-                let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(64);
+                let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(3000);
                 let transport =
                     runtime.block_on(Transport::new(emitter.clone(), incoming_tx, outgoing_rx))?;
-                let sdp = runtime.block_on(transport.offer())?;
                 self.transport = Some(transport);
-                self.pending = Some(Pending {
+                // Capture and encode while ICE gathering and HTTP/WebRTC negotiation
+                // are in progress. The transport retains frames until GPT-Live connects.
+                self.engine = Some(Engine::start(
                     io,
-                    incoming: incoming_rx,
-                    outgoing: outgoing_tx,
-                });
+                    incoming_rx,
+                    outgoing_tx,
+                    emitter.clone(),
+                    self.muted,
+                )?);
+                let transport = self
+                    .transport
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("transport was not initialized"))?;
+                let sdp = runtime.block_on(transport.offer())?;
                 emitter.emit(serde_json::json!({ "type": "offer", "sdp": sdp }));
             }
             Command::Answer { sdp } => {
@@ -208,18 +275,7 @@ impl Session {
                     .transport
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("session not started"))?;
-                let pending = self
-                    .pending
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("answer already applied"))?;
                 runtime.block_on(transport.apply_answer(sdp))?;
-                self.engine = Some(Engine::start(
-                    pending.io,
-                    pending.incoming,
-                    pending.outgoing,
-                    emitter.clone(),
-                    self.muted,
-                )?);
                 emitter.emit(serde_json::json!({ "type": "connected" }));
             }
             Command::Mute { muted } => {
@@ -239,8 +295,6 @@ impl Session {
                 let samples = button_sfx_samples()?;
                 if let Some(engine) = &self.engine {
                     engine.queue_sfx(&samples);
-                } else if let Some(pending) = &self.pending {
-                    pending.io.queue_sfx(&samples);
                 } else {
                     anyhow::bail!("audio output is not ready for SFX");
                 }
@@ -270,7 +324,6 @@ impl Session {
 
     fn shutdown(&mut self, runtime: &tokio::runtime::Runtime) {
         self.engine.take();
-        self.pending.take();
         if let Some(transport) = self.transport.take() {
             runtime.block_on(transport.close());
         }

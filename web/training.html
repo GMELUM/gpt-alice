@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f5f7" />
+    <title>GPT Alice — запись примеров голоса</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #17191f;
+        background: #f4f5f7;
+        --muted: #737985;
+        --line: #e7e9ed;
+        --purple: #684bd5;
+        --purple-soft: #f0edff;
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      body { min-width: 320px; min-height: 100vh; margin: 0; }
+      button, input, select { font: inherit; }
+      main { width: min(100% - 32px, 760px); margin: 0 auto; padding: 30px 0 52px; }
+      .back { display: inline-flex; margin-bottom: 20px; color: #5d45bf; font-size: 13px; text-decoration: none; }
+      .eyebrow { color: var(--muted); font-size: 12px; }
+      h1 { margin: 6px 0 8px; font-size: clamp(25px, 4vw, 34px); letter-spacing: -.04em; }
+      .intro { max-width: 650px; margin: 0 0 24px; color: var(--muted); font-size: 14px; line-height: 1.6; }
+      .panel { padding: 22px; background: #fff; border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 12px 30px #25263a08; }
+      .panel + .panel { margin-top: 14px; }
+      h2 { margin: 0 0 8px; font-size: 16px; }
+      .hint { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+      .button-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 19px; }
+      .button { min-height: 42px; padding: 0 15px; color: #fff; background: var(--purple); border: 0; border-radius: 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+      .button.secondary { color: #4f5562; background: #f1f2f5; }
+      .button.record { background: #be3155; }
+      .button:disabled { cursor: wait; opacity: .55; }
+      .status { min-height: 20px; margin-top: 13px; color: #5f6571; font-size: 12px; line-height: 1.5; }
+      .status.error { color: #b33c4a; }
+      .status.success { color: #218658; }
+      .recording-dot { display: inline-block; width: 8px; height: 8px; margin-right: 7px; background: #ce355c; border-radius: 50%; animation: pulse 1s infinite; }
+      @keyframes pulse { 50% { opacity: .25; } }
+      .audio-preview { display: none; width: 100%; margin-top: 16px; }
+      .local-notice { padding: 14px 16px; color: #514a71; background: var(--purple-soft); border: 1px solid #e5dfff; border-radius: 12px; font-size: 12px; line-height: 1.6; }
+      .warning { display: none; border-color: #efd9aa; background: #fff8e8; color: #725722; }
+      .warning code, .local-notice code { padding: 2px 5px; background: #0000000a; border-radius: 5px; }
+      .warning pre { overflow: auto; margin: 10px 0 0; padding: 11px; background: #fff; border: 1px solid #eee2c6; border-radius: 8px; color: #30323a; }
+      .small { color: var(--muted); font-size: 11px; line-height: 1.55; }
+      .footer { margin-top: 16px; color: #8a909b; font-size: 10px; line-height: 1.6; }
+      @media (max-width: 520px) { main { width: min(100% - 22px, 760px); padding-top: 20px; } .panel { padding: 17px; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <a class="back" href="/">← Вернуться в панель</a>
+      <div class="eyebrow">GPT Alice · подготовка голосового детектора</div>
+      <h1>Запись своего голоса</h1>
+      <p class="intro">Записывай только слово «Алиса». Для разнообразия произноси его по-разному: спокойно, шёпотом, громко, издалека или с другой интонацией. Ничего выбирать и заполнять не нужно.</p>
+
+      <section class="panel warning" id="insecure-warning" aria-live="polite">
+        <h2>Для микрофона браузера нужна защищённая страница</h2>
+        <p class="hint">Браузер разрешает запись микрофона только на защищённой странице. Если открыта колонка по адресу <code>http://192.168…</code>, микрофон будет заблокирован. Запусти локальный сборщик в папке проекта и открой адрес ниже:</p>
+        <pre><code>cargo run --bin gpt-alice-training-recorder
+http://127.0.0.1:8170</code></pre>
+        <p class="small">Сборщик слушает только этот Mac и сохраняет WAV-файлы в <code>training/corpus/recorded/</code>.</p>
+      </section>
+
+      <div id="recorder" hidden>
+        <section class="panel">
+          <h2>Запись</h2>
+          <p class="hint" id="recording-hint">Используется микрофон, выбранный в системных настройках или браузере. Максимальная длина одного дубля — 8 секунд. Запись не отправляется, пока ты не нажмёшь «Сохранить».</p>
+          <div class="button-row">
+            <button class="button record" id="record-start" type="button">Начать запись</button>
+            <button class="button secondary" id="record-stop" type="button" disabled>Остановить</button>
+            <button class="button secondary" id="record-save" type="button" disabled>Сохранить WAV</button>
+            <button class="button secondary" id="record-discard" type="button" disabled>Отменить дубль</button>
+          </div>
+          <div class="status" id="record-status" role="status" aria-live="polite">Готово к записи.</div>
+          <audio class="audio-preview" id="audio-preview" controls></audio>
+          <div class="status" id="save-status" role="status" aria-live="polite"></div>
+        </section>
+        <div class="local-notice" id="training-storage-notice"><strong>Локальное хранение.</strong> По одному WAV и JSON-файлу на дубль. Сохраняются фактическая длительность, источник записи, случайный ID диктора и SHA-256 — без тегов темпа и интонации.</div>
+      </div>
+      <div class="footer" id="training-footer">Записи пользователя остаются локальными и не передаются TeraTTS или OpenAI. Остановить запись можно в любой момент.</div>
+    </main>
+    <script>
+      const isLoopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(location.hostname);
+      const deviceMode = !isLoopback && location.port === "";
+      const secure = window.isSecureContext && navigator.mediaDevices?.getUserMedia;
+      const warning = document.querySelector("#insecure-warning");
+      const recorderPanel = document.querySelector("#recorder");
+      warning.style.display = secure || deviceMode ? "none" : "block";
+      recorderPanel.hidden = !secure && !deviceMode;
+
+      if (deviceMode) {
+        const startButton = document.querySelector("#record-start");
+        const stopButton = document.querySelector("#record-stop");
+        const saveButton = document.querySelector("#record-save");
+        const discardButton = document.querySelector("#record-discard");
+        const recordStatus = document.querySelector("#record-status");
+        const saveStatus = document.querySelector("#save-status");
+        const preview = document.querySelector("#audio-preview");
+        const speakerKey = "gpt-alice-training-speaker-id";
+        let speakerId = localStorage.getItem(speakerKey);
+        if (!speakerId) {
+          speakerId = `self-${crypto.randomUUID()}`;
+          localStorage.setItem(speakerKey, speakerId);
+        }
+        let recordingStartedAt = 0;
+        let stopTimer = null;
+        let clockTimer = null;
+        let isRecording = false;
+
+        document.querySelector("#recording-hint").textContent = "Записывает массив микрофонов самой колонки. Длина дубля — до 8 секунд; останови запись сразу после произношения. WAV сохраняется на колонке после нажатия «Остановить» и доступен для скачивания.";
+        document.querySelector("#training-storage-notice").innerHTML = "<strong>Запись на колонке.</strong> WAV и JSON-метаданные хранятся рядом с приложением в <code>training/corpus/recorded/</code>. В метаданных — только фактическая длительность, источник, ID диктора и SHA-256. После дубля скачай оба файла.";
+        document.querySelector("#training-footer").textContent = "Аудио записывается внутренними микрофонами Mini 3 и не отправляется в облако. Во время записи звонок и wake-word детектор не используют микрофон.";
+        startButton.textContent = "Записать «Алиса»";
+        stopButton.textContent = "Остановить и сохранить";
+        saveButton.hidden = true;
+        discardButton.hidden = true;
+
+        function currentSeconds(ms) { return `${(ms / 1000).toLocaleString("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} с`; }
+        function metadata() { return { speaker_id: speakerId }; }
+        function setStatus(text, error = false, success = false) {
+          recordStatus.textContent = text;
+          recordStatus.classList.toggle("error", error);
+          recordStatus.classList.toggle("success", success);
+        }
+        async function responseJson(response) {
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.message || `HTTP ${response.status}`);
+          return result;
+        }
+        async function stopDeviceRecording() {
+          if (!isRecording) return;
+          isRecording = false;
+          clearTimeout(stopTimer); clearInterval(clockTimer);
+          stopButton.disabled = true; startButton.disabled = true;
+          setStatus("Готовлю и сохраняю запись с микрофона колонки…");
+          try {
+            const result = await responseJson(await fetch("/api/training/capture/stop", {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(metadata()),
+            }));
+            const wavUrl = `/api/training/recordings/${encodeURIComponent(result.filename)}`;
+            preview.src = wavUrl; preview.style.display = "block";
+            saveStatus.textContent = `Сохранено на колонке: ${result.filename} · SHA-256 ${result.sha256} · `;
+            const wavLink = document.createElement("a");
+            wavLink.href = wavUrl; wavLink.download = result.filename; wavLink.textContent = "Скачать WAV";
+            const jsonLink = document.createElement("a");
+            jsonLink.href = `/api/training/recordings/${encodeURIComponent(result.filename.replace(/\.wav$/, ".json"))}`;
+            jsonLink.download = result.filename.replace(/\.wav$/, ".json"); jsonLink.textContent = "JSON-метаданные";
+            saveStatus.append(wavLink, document.createTextNode(" · "), jsonLink);
+            startButton.disabled = false;
+            setStatus("Дубль сохранён. Можно записать следующий вариант.", false, true);
+          } catch (error) {
+            startButton.disabled = false;
+            setStatus(`Не удалось сохранить запись: ${error.message}`, true);
+          }
+        }
+
+        startButton.addEventListener("click", async () => {
+          startButton.disabled = true; saveStatus.textContent = "";
+          try {
+            await responseJson(await fetch("/api/training/capture/start", {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(metadata()),
+            }));
+            isRecording = true; recordingStartedAt = performance.now();
+            stopButton.disabled = false;
+            setStatus(`<span class="recording-dot"></span>Идёт запись на колонке · 0,0 / 8,0 с`);
+            clockTimer = setInterval(() => {
+              const elapsed = Math.min(8000, performance.now() - recordingStartedAt);
+              recordStatus.innerHTML = `<span class="recording-dot"></span>Идёт запись на колонке · ${currentSeconds(elapsed)} / 8,0 с`;
+            }, 100);
+            stopTimer = setTimeout(stopDeviceRecording, 8000);
+          } catch (error) {
+            startButton.disabled = false;
+            setStatus(`Не удалось начать запись: ${error.message}`, true);
+          }
+        });
+        stopButton.addEventListener("click", stopDeviceRecording);
+      } else if (secure) {
+        const startButton = document.querySelector("#record-start");
+        const stopButton = document.querySelector("#record-stop");
+        const saveButton = document.querySelector("#record-save");
+        const discardButton = document.querySelector("#record-discard");
+        const recordStatus = document.querySelector("#record-status");
+        const saveStatus = document.querySelector("#save-status");
+        const preview = document.querySelector("#audio-preview");
+        const MAX_RECORDING_MS = 8000;
+        let mediaRecorder = null;
+        let mediaStream = null;
+        let chunks = [];
+        let draftWav = null;
+        let draftMetadata = null;
+        let recordingStartedAt = 0;
+        let actualDurationMs = 0;
+        let stopTimer = null;
+        let clockTimer = null;
+        let previewUrl = null;
+        const speakerKey = "gpt-alice-training-speaker-id";
+        let speakerId = localStorage.getItem(speakerKey);
+        if (!speakerId) {
+          speakerId = `self-${crypto.randomUUID()}`;
+          localStorage.setItem(speakerKey, speakerId);
+        }
+
+        function sayStatus(text, error = false, success = false) {
+          recordStatus.textContent = text;
+          recordStatus.classList.toggle("error", error);
+          recordStatus.classList.toggle("success", success);
+        }
+        function currentSeconds(ms) { return `${(ms / 1000).toLocaleString("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} с`; }
+        function encodeWav(samples, sampleRate) {
+          const pcmBytes = samples.length * 2;
+          const buffer = new ArrayBuffer(44 + pcmBytes);
+          const view = new DataView(buffer);
+          const writeText = (offset, text) => { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); };
+          writeText(0, "RIFF"); view.setUint32(4, 36 + pcmBytes, true); writeText(8, "WAVE");
+          writeText(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+          view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+          view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+          writeText(36, "data"); view.setUint32(40, pcmBytes, true);
+          for (let i = 0; i < samples.length; i++) {
+            const value = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(44 + i * 2, value < 0 ? value * 32768 : value * 32767, true);
+          }
+          return new Blob([buffer], { type: "audio/wav" });
+        }
+
+        async function toTrainingWav(blob) {
+          const context = new AudioContext();
+          try {
+            const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+            const mono = context.createBuffer(1, decoded.length, decoded.sampleRate);
+            const out = mono.getChannelData(0);
+            for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+              const input = decoded.getChannelData(channel);
+              for (let i = 0; i < input.length; i++) out[i] += input[i] / decoded.numberOfChannels;
+            }
+            const sampleRate = 16000;
+            const frameCount = Math.ceil(decoded.duration * sampleRate);
+            const offline = new OfflineAudioContext(1, frameCount, sampleRate);
+            const source = offline.createBufferSource();
+            source.buffer = mono;
+            source.connect(offline.destination);
+            source.start();
+            const rendered = await offline.startRendering();
+            return encodeWav(rendered.getChannelData(0), sampleRate);
+          } finally { await context.close(); }
+        }
+
+        function releaseMicrophone() {
+          if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+          mediaStream = null;
+        }
+
+        async function finalizeRecording() {
+          const blob = new Blob(chunks, { type: mediaRecorder?.mimeType || "audio/webm" });
+          releaseMicrophone();
+          if (!blob.size) {
+            sayStatus("Браузер не вернул аудиоданные. Проверь микрофон и попробуй ещё раз.", true);
+            startButton.disabled = false;
+            return;
+          }
+          try {
+            draftWav = await toTrainingWav(blob);
+            if (previewUrl) URL.revokeObjectURL(previewUrl);
+            previewUrl = URL.createObjectURL(draftWav);
+            preview.src = previewUrl;
+            preview.style.display = "block";
+            saveButton.disabled = false;
+            discardButton.disabled = false;
+            startButton.disabled = false;
+            sayStatus(`Черновик готов · ${currentSeconds(actualDurationMs)} · ${Math.round(draftWav.size / 1024)} КБ. Прослушай и сохрани, если дубль подходит.`, false, true);
+          } catch (error) {
+            startButton.disabled = false;
+            sayStatus(`Не удалось подготовить WAV: ${error.message}`, true);
+          }
+        }
+
+        startButton.addEventListener("click", async () => {
+          if (draftWav) {
+            sayStatus("Сначала сохрани или отмени готовый дубль.", true);
+            return;
+          }
+          if (previewUrl) URL.revokeObjectURL(previewUrl);
+          previewUrl = null; preview.removeAttribute("src"); preview.style.display = "none";
+          draftWav = null; draftMetadata = null; saveButton.disabled = true; discardButton.disabled = true; saveStatus.textContent = "";
+          startButton.disabled = true; chunks = [];
+          try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+              audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+            });
+            const mimeType = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find(type => MediaRecorder.isTypeSupported(type));
+            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+            mediaRecorder.addEventListener("dataavailable", event => { if (event.data.size) chunks.push(event.data); });
+            mediaRecorder.addEventListener("stop", finalizeRecording, { once: true });
+            mediaRecorder.start(100);
+            draftMetadata = { speaker_id: speakerId };
+            recordingStartedAt = performance.now();
+            stopButton.disabled = false;
+            sayStatus("Запись… произнеси: «Алиса»");
+            clockTimer = setInterval(() => {
+              actualDurationMs = Math.min(MAX_RECORDING_MS, performance.now() - recordingStartedAt);
+              recordStatus.innerHTML = `<span class="recording-dot"></span>Идёт запись · ${currentSeconds(actualDurationMs)} / 8,0 с`;
+            }, 100);
+            stopTimer = setTimeout(() => stopRecording(), MAX_RECORDING_MS);
+          } catch (error) {
+            releaseMicrophone(); startButton.disabled = false;
+            sayStatus(`Нет доступа к микрофону: ${error.message}`, true);
+          }
+        });
+
+        function stopRecording() {
+          if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+          clearTimeout(stopTimer); clearInterval(clockTimer);
+          actualDurationMs = Math.round(Math.min(MAX_RECORDING_MS, performance.now() - recordingStartedAt));
+          stopButton.disabled = true;
+          sayStatus("Готовлю WAV для прослушивания…");
+          mediaRecorder.stop();
+        }
+        stopButton.addEventListener("click", stopRecording);
+
+        discardButton.addEventListener("click", () => {
+          if (previewUrl) URL.revokeObjectURL(previewUrl);
+          previewUrl = null; preview.removeAttribute("src"); preview.style.display = "none";
+          draftWav = null; draftMetadata = null; saveButton.disabled = true; discardButton.disabled = true;
+          saveStatus.textContent = "";
+          sayStatus("Дубль отменён. Настройки можно изменить и записать снова.");
+        });
+
+        saveButton.addEventListener("click", async () => {
+          if (!draftWav || !draftMetadata) return;
+          saveButton.disabled = true; startButton.disabled = true;
+          sayStatus("Сохраняю WAV на этот Mac…");
+          try {
+            const digest = await crypto.subtle.digest("SHA-256", await draftWav.arrayBuffer());
+            const sha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+            const params = new URLSearchParams({
+              ...draftMetadata, duration_ms: String(Math.round(actualDurationMs)), sha256,
+            });
+            const response = await fetch(`/api/training/recordings?${params}`, {
+              method: "POST", headers: { "Content-Type": "audio/wav" }, body: draftWav,
+            });
+            const result = await response.json();
+            if (!response.ok || !result.ok) throw new Error(result.message || `HTTP ${response.status}`);
+            saveStatus.textContent = `Сохранено: ${result.filename} · SHA-256 ${result.sha256}`;
+            saveStatus.classList.add("success");
+            draftWav = null; draftMetadata = null; saveButton.disabled = true; discardButton.disabled = true;
+            sayStatus("Дубль сохранён. Можно записать следующий вариант.", false, true);
+          } catch (error) {
+            sayStatus(`Не удалось сохранить: ${error.message}`, true);
+          } finally { saveButton.disabled = false; startButton.disabled = false; }
+        });
+      }
+    </script>
+  </body>
+</html>

@@ -6,7 +6,7 @@ use std::{
     net::ToSocketAddrs,
     os::fd::AsRawFd,
     path::PathBuf,
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::indicators::{ActionResult, IndicatorController};
+use crate::mixer::AudioMixer;
 
 const GPIO_KEYS: &str = "/dev/input/event0";
 const TOUCH_KEYS: &str = "/dev/input/event1";
@@ -77,6 +78,10 @@ pub struct RuntimeStatus {
 pub struct BluetoothStatus {
     pub available: bool,
     pub enabled: Option<bool>,
+    pub connected: bool,
+    pub device_name: Option<String>,
+    pub volume: u8,
+    pub ducked: bool,
 }
 
 #[derive(Serialize)]
@@ -102,6 +107,7 @@ pub struct TimeSettings {
     pub utc_offset_minutes: i16,
     pub ntp_servers: Vec<String>,
     pub clock_brightness_percent: u8,
+    pub output_volume_percent: u8,
 }
 
 impl Default for TimeSettings {
@@ -113,6 +119,7 @@ impl Default for TimeSettings {
                 .map(|server| (*server).to_owned())
                 .collect(),
             clock_brightness_percent: 59,
+            output_volume_percent: 50,
         }
     }
 }
@@ -144,44 +151,63 @@ struct State {
     volume: u8,
     output_muted: bool,
     bluetooth_enabled: Option<bool>,
+    bluetooth_volume: u8,
+    bluetooth_ducked: bool,
+    bluetooth_duck_gain: f32,
+    timer_remaining_seconds: Option<u64>,
     button_callbacks: Vec<Arc<dyn Fn(DeviceEvent) + Send + Sync>>,
 }
 
 pub struct RuntimeController {
     indicators: Arc<IndicatorController>,
+    audio_mixer: Arc<AudioMixer>,
     state: Arc<Mutex<State>>,
     events: broadcast::Sender<DeviceEvent>,
     config_path: PathBuf,
 }
 
 impl RuntimeController {
-    pub fn new(indicators: Arc<IndicatorController>) -> Self {
+    pub fn new(indicators: Arc<IndicatorController>, audio_mixer: Arc<AudioMixer>) -> Self {
         let (events, _) = broadcast::channel(64);
         let config_path = env::var_os("GPT_ALICE_CONFIG_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
         let time_settings = load_time_settings(&config_path);
+        let initial_volume = time_settings.output_volume_percent;
+        audio_mixer.set_output_volume(initial_volume);
+        // The shared mixer owns software volume. Keep the hardware mixer at unity
+        // so it cannot mute or scale only part of the mixed signal.
+        if let Err(error) = set_system_volume(100) {
+            eprintln!("could not normalize ALSA hardware volume: {error}");
+        }
         let initial_brightness =
             ((u16::from(time_settings.clock_brightness_percent) * 255 + 50) / 100) as u8;
         let _ = indicators
             .set_clock_display_brightness(initial_brightness, time_settings.utc_offset_minutes);
+        let state = Arc::new(Mutex::new(State {
+            last_event: None,
+            recent_events: VecDeque::with_capacity(16),
+            event_count: 0,
+            display: DisplayScene {
+                name: "clock".into(),
+                until: None,
+            },
+            time_settings,
+            microphone_muted: None,
+            volume: initial_volume,
+            output_muted: false,
+            bluetooth_enabled: read_bluetooth_power(),
+            bluetooth_volume: read_bluetooth_volume().unwrap_or(88),
+            bluetooth_ducked: false,
+            bluetooth_duck_gain: 1.0,
+            timer_remaining_seconds: None,
+            button_callbacks: Vec::new(),
+        }));
+        Self::bluetooth_duck_loop(Arc::clone(&state));
         Self {
             indicators,
-            state: Arc::new(Mutex::new(State {
-                last_event: None,
-                recent_events: VecDeque::with_capacity(16),
-                event_count: 0,
-                display: DisplayScene {
-                    name: "clock".into(),
-                    until: None,
-                },
-                time_settings,
-                microphone_muted: None,
-                volume: read_system_volume().unwrap_or(5),
-                output_muted: false,
-                bluetooth_enabled: read_bluetooth_power(),
-                button_callbacks: Vec::new(),
-            })),
+            audio_mixer,
+            state,
             events,
             config_path,
         }
@@ -189,6 +215,28 @@ impl RuntimeController {
 
     pub fn indicators(&self) -> &IndicatorController {
         &self.indicators
+    }
+
+    pub fn queue_audio_test_tone(&self) -> Result<ActionResult, String> {
+        self.audio_mixer.queue_test_tone()?;
+        Ok(ActionResult {
+            ok: true,
+            message: "Тестовый тон поставлен в общий аудиомикшер".into(),
+        })
+    }
+
+    pub fn set_timer_display(&self, remaining_seconds: Option<u64>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.timer_remaining_seconds = remaining_seconds;
+            if state.display.until.is_none() {
+                if let Some(seconds) = remaining_seconds {
+                    let _ = self.indicators.render_timer_countdown(seconds);
+                } else {
+                    let offset = state.time_settings.utc_offset_minutes;
+                    let _ = self.indicators.render_idle_clock(offset);
+                }
+            }
+        }
     }
 
     pub fn start(&self) {
@@ -214,6 +262,7 @@ impl RuntimeController {
             .time_settings
             .clone();
         let _ = save_time_settings(&config_path, &settings);
+        Self::bluetooth_audio_bridge_loop(Arc::clone(&self.state), Arc::clone(&self.audio_mixer));
         let startup_servers = settings.ntp_servers.clone();
         thread::Builder::new()
             .name("ntp-sources".into())
@@ -231,40 +280,48 @@ impl RuntimeController {
                         .lock()
                         .map(|state| state.time_settings.utc_offset_minutes)
                         .unwrap_or(0);
-                    let expired = state
+                    let (expired, timer_remaining, idle) = state
                         .lock()
-                        .ok()
-                        .and_then(|mut state| {
-                            state
+                        .map(|mut state| {
+                            let expired = state
                                 .display
                                 .until
-                                .filter(|deadline| Instant::now() >= *deadline)
-                                .map(|_| {
-                                    state.display = DisplayScene {
-                                        name: "clock".into(),
-                                        until: None,
-                                    };
-                                })
+                                .is_some_and(|deadline| Instant::now() >= deadline);
+                            if expired {
+                                state.display = DisplayScene {
+                                    name: "clock".into(),
+                                    until: None,
+                                };
+                            }
+                            (
+                                expired,
+                                state.timer_remaining_seconds,
+                                state.display.until.is_none(),
+                            )
                         })
-                        .is_some();
+                        .unwrap_or((false, None, false));
                     if expired {
                         let event = DeviceEvent::SceneChanged {
                             scene: "clock".into(),
                         };
                         record_event(&state, &events, event);
-                        let _ = indicators.render_idle_clock(offset);
-                    } else if state
-                        .lock()
-                        .map(|state| state.display.until.is_none())
-                        .unwrap_or(false)
-                        && SystemTime::now()
+                        if let Some(seconds) = timer_remaining {
+                            let _ = indicators.render_timer_countdown(seconds);
+                        } else {
+                            let _ = indicators.render_idle_clock(offset);
+                        }
+                    } else if idle {
+                        if let Some(seconds) = timer_remaining {
+                            let _ = indicators.render_timer_countdown(seconds);
+                        } else if SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs()
                             % 60
                             == 0
-                    {
-                        let _ = indicators.refresh_display(offset);
+                        {
+                            let _ = indicators.render_idle_clock(offset);
+                        }
                     }
                 }
             })
@@ -283,6 +340,7 @@ impl RuntimeController {
                     .saturating_duration_since(Instant::now())
                     .as_millis()
         });
+        let connected_device = read_bluetooth_connected();
         RuntimeStatus {
             input_devices: vec![
                 InputDeviceStatus {
@@ -314,6 +372,10 @@ impl RuntimeController {
             bluetooth: BluetoothStatus {
                 available: std::path::Path::new("/sys/class/bluetooth/hci0").exists(),
                 enabled: state.bluetooth_enabled,
+                connected: connected_device.is_some(),
+                device_name: connected_device,
+                volume: state.bluetooth_volume,
+                ducked: state.bluetooth_ducked,
             },
         }
     }
@@ -431,7 +493,7 @@ impl RuntimeController {
             _ => return false,
         };
 
-        let (volume, output_muted, changed) = {
+        let (volume, output_muted, changed, settings) = {
             let Ok(mut state) = self.state.lock() else {
                 return false;
             };
@@ -439,20 +501,28 @@ impl RuntimeController {
             let changed = next_volume != state.volume;
             if changed {
                 if !state.output_muted {
-                    if let Err(error) = set_system_volume(next_volume) {
-                        eprintln!("system volume update failed: {error}");
-                        return false;
-                    }
+                    self.audio_mixer.set_output_volume(next_volume);
                 }
                 state.volume = next_volume;
+                state.time_settings.output_volume_percent = next_volume;
             }
             let output_muted = state.output_muted;
             state.display = DisplayScene {
                 name: "volume".into(),
                 until: Some(Instant::now() + Duration::from_secs(2)),
             };
-            (state.volume, output_muted, changed)
+            (
+                state.volume,
+                output_muted,
+                changed,
+                state.time_settings.clone(),
+            )
         };
+        if changed {
+            if let Err(error) = save_time_settings(&self.config_path, &settings) {
+                eprintln!("could not save output volume: {error}");
+            }
+        }
         if let Err(error) = self
             .indicators
             .render_volume(if output_muted { 0 } else { volume })
@@ -466,21 +536,23 @@ impl RuntimeController {
         if volume > 100 {
             return Err("Громкость должна быть от 0 до 100".into());
         }
-        let muted = {
+        let (muted, settings) = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "Не удалось получить состояние громкости".to_owned())?;
             if !state.output_muted {
-                set_system_volume(volume)?;
+                self.audio_mixer.set_output_volume(volume);
             }
             state.volume = volume;
+            state.time_settings.output_volume_percent = volume;
             state.display = DisplayScene {
                 name: "volume".into(),
                 until: Some(Instant::now() + Duration::from_secs(2)),
             };
-            state.output_muted
+            (state.output_muted, state.time_settings.clone())
         };
+        save_time_settings(&self.config_path, &settings)?;
         self.indicators
             .render_volume(if muted { 0 } else { volume })?;
         Ok(ActionResult {
@@ -512,8 +584,8 @@ impl RuntimeController {
             if state.output_muted == muted {
                 state.volume
             } else {
-                let hardware_volume = if muted { 0 } else { state.volume };
-                set_system_volume(hardware_volume)?;
+                self.audio_mixer
+                    .set_output_volume(if muted { 0 } else { state.volume });
                 state.output_muted = muted;
                 state.volume
             }
@@ -572,17 +644,14 @@ impl RuntimeController {
     }
 
     pub fn set_bluetooth_enabled(&self, enabled: bool) -> Result<ActionResult, String> {
-        let output = Command::new("/usr/bin/bluetoothctl")
-            .args(["power", if enabled { "on" } else { "off" }])
-            .output()
-            .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(if detail.is_empty() {
-                format!("bluetoothctl завершился с кодом {}", output.status)
-            } else {
-                detail
-            });
+        if enabled {
+            run_bluetoothctl(&["power", "on"])?;
+            run_bluetoothctl(&["discoverable-timeout", "0"])?;
+            run_bluetoothctl(&["pairable", "on"])?;
+            run_bluetoothctl(&["discoverable", "on"])?;
+        } else {
+            run_bluetoothctl(&["discoverable", "off"])?;
+            run_bluetoothctl(&["power", "off"])?;
         }
         let mut actual = read_bluetooth_power();
         for _ in 0..20 {
@@ -602,26 +671,273 @@ impl RuntimeController {
         Ok(ActionResult {
             ok: true,
             message: if enabled {
-                "Bluetooth включён".into()
+                "Bluetooth включён, колонка доступна для сопряжения".into()
             } else {
                 "Bluetooth выключен".into()
             },
         })
     }
+
+    pub fn set_bluetooth_volume(&self, volume: u8) -> Result<ActionResult, String> {
+        if volume > 100 {
+            return Err("Громкость Bluetooth должна быть от 0 до 100".into());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Не удалось получить состояние Bluetooth".to_owned())?;
+        state.bluetooth_volume = volume;
+        Ok(ActionResult {
+            ok: true,
+            message: format!("Громкость Bluetooth установлена: {volume}%"),
+        })
+    }
+
+    pub fn adjust_bluetooth_volume(&self, delta: i16) -> Result<ActionResult, String> {
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| "Не удалось получить состояние Bluetooth".to_owned())?
+            .bluetooth_volume;
+        self.set_bluetooth_volume((i16::from(current) + delta).clamp(0, 100) as u8)
+    }
+
+    pub fn bluetooth_playback(&self, action: &str) -> Result<ActionResult, String> {
+        let action = match action {
+            "play" | "pause" | "next" | "previous" => action,
+            _ => return Err("Неизвестная команда воспроизведения Bluetooth".into()),
+        };
+        let output = Command::new("/usr/bin/bluetoothctl")
+            .args(["--timeout", "3", "player", action])
+            .output()
+            .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
+        let text = format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success()
+            || text.to_ascii_lowercase().contains("not available")
+            || text.to_ascii_lowercase().contains("not connected")
+            || text.to_ascii_lowercase().contains("no player")
+            || text.to_ascii_lowercase().contains("failed")
+        {
+            return Err(if text.trim().is_empty() {
+                "Управление недоступно: подключи телефон как Bluetooth-источник".into()
+            } else {
+                text.trim().to_owned()
+            });
+        }
+        let message = match action {
+            "play" => "Воспроизведение продолжено",
+            "pause" => "Воспроизведение приостановлено",
+            "next" => "Переключил на следующий трек",
+            _ => "Переключил на предыдущий трек",
+        };
+        Ok(ActionResult {
+            ok: true,
+            message: message.into(),
+        })
+    }
+
+    pub fn set_agent_speaking(&self, speaking: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.bluetooth_ducked = speaking;
+        }
+    }
+
+    fn bluetooth_duck_loop(state: Arc<Mutex<State>>) {
+        thread::Builder::new()
+            .name("bluetooth-duck".into())
+            .spawn(move || {
+                let mut gain = 1.0_f32;
+                loop {
+                    let target = {
+                        let Ok(state) = state.lock() else { break };
+                        if state.bluetooth_ducked { 0.2 } else { 1.0 }
+                    };
+                    let step = 0.04_f32;
+                    gain = if gain < target {
+                        (gain + step).min(target)
+                    } else {
+                        (gain - step).max(target)
+                    };
+                    if let Ok(mut state) = state.lock() {
+                        state.bluetooth_duck_gain = gain;
+                    }
+                    thread::sleep(Duration::from_millis(40));
+                }
+            })
+            .ok();
+    }
+
+    fn bluetooth_audio_bridge_loop(state: Arc<Mutex<State>>, mixer: Arc<AudioMixer>) {
+        thread::Builder::new()
+            .name("bluetooth-audio-bridge".into())
+            .spawn(move || {
+                // Bluetooth is captured from BlueALSA and handed to the shared mixer.
+                let _ = Command::new("/etc/init.d/S53bluealsa-aplay")
+                    .arg("stop")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+
+                let mut bridge: Option<BluetoothAudioBridge> = None;
+                loop {
+                    let enabled = state
+                        .lock()
+                        .map(|state| state.bluetooth_enabled == Some(true))
+                        .unwrap_or(false);
+                    let source = enabled.then(read_bluetooth_capture_source).flatten();
+
+                    if bridge
+                        .as_ref()
+                        .is_some_and(|current| source.as_deref() != Some(&current.address))
+                    {
+                        if let Some(mut current) = bridge.take() {
+                            current.stop();
+                        }
+                    }
+
+                    if let Some(current) = bridge.as_mut() {
+                        let capture_exited = current.capture.try_wait().ok().flatten().is_some();
+                        if capture_exited {
+                            eprintln!(
+                                "Bluetooth audio bridge stopped (capture_exited={capture_exited})"
+                            );
+                            if let Some(mut current) = bridge.take() {
+                                current.stop();
+                            }
+                        }
+                    }
+
+                    if bridge.is_none()
+                        && let Some(address) = source
+                    {
+                        match BluetoothAudioBridge::start(
+                            address,
+                            Arc::clone(&state),
+                            Arc::clone(&mixer),
+                        ) {
+                            Ok(started) => {
+                                eprintln!("Bluetooth A2DP audio bridge started");
+                                bridge = Some(started);
+                            }
+                            Err(error) => {
+                                eprintln!("Bluetooth A2DP audio bridge failed to start: {error}");
+                            }
+                        }
+                    }
+
+                    thread::sleep(Duration::from_secs(2));
+                }
+            })
+            .ok();
+    }
 }
 
-fn read_system_volume() -> Option<u8> {
-    let output = Command::new("/usr/bin/amixer")
-        .args(["-c", "0", "get", "Master"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().find_map(|line| {
-        let percent_start = line.find('[')? + 1;
-        let percent_end = line[percent_start..].find("%]")? + percent_start;
-        line[percent_start..percent_end].parse::<u8>().ok()
-    })
+struct BluetoothAudioBridge {
+    address: String,
+    capture: Child,
+    worker: Option<thread::JoinHandle<()>>,
 }
+
+impl BluetoothAudioBridge {
+    fn start(
+        address: String,
+        state: Arc<Mutex<State>>,
+        mixer: Arc<AudioMixer>,
+    ) -> Result<Self, String> {
+        let mut capture_command = Command::new("/usr/bin/arecord");
+        capture_command
+            .args([
+                "-q",
+                "-D",
+                &format!("bluealsa:DEV={address},PROFILE=a2dp"),
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-r",
+                "44100",
+                "-c",
+                "2",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        set_parent_death_signal(&mut capture_command);
+        let mut capture = capture_command
+            .spawn()
+            .map_err(|error| format!("не удалось запустить arecord: {error}"))?;
+        let mut capture_output = capture
+            .stdout
+            .take()
+            .ok_or_else(|| "arecord не открыл аудиопоток".to_owned())?;
+        let worker = thread::Builder::new()
+            .name("bluetooth-audio-mixer".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut samples = [0_u8; 4096];
+                loop {
+                    if capture_output.read_exact(&mut samples).is_err() {
+                        break;
+                    }
+                    let (volume, duck_gain) = match state.lock() {
+                        Ok(state) => (state.bluetooth_volume, state.bluetooth_duck_gain),
+                        Err(_) => break,
+                    };
+                    let gain = f32::from(volume) * duck_gain / 100.0;
+                    mixer.push_bluetooth(&samples, gain);
+                }
+            })
+            .map_err(|error| format!("не удалось запустить аудиомикшер Bluetooth: {error}"))?;
+        Ok(Self {
+            address,
+            capture,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop(&mut self) {
+        let _ = self.capture.kill();
+        let _ = self.capture.wait();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for BluetoothAudioBridge {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_parent_death_signal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // The bridge children must not outlive gpt-alice on a service restart.
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == 0 {
+                if libc::getppid() == parent_pid {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        "gpt-alice exited during bridge startup",
+                    ))
+                }
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_parent_death_signal(_command: &mut Command) {}
 
 fn set_system_volume(volume: u8) -> Result<(), String> {
     let output = Command::new("/usr/bin/amixer")
@@ -646,6 +962,111 @@ fn read_bluetooth_power() -> Option<bool> {
         .lines()
         .find_map(|line| line.trim().strip_prefix("Powered:"))
         .map(|value| value.trim() == "yes")
+}
+
+fn run_bluetoothctl(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("/usr/bin/bluetoothctl")
+        .args(args)
+        .output()
+        .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
+    let detail = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lower = detail.to_ascii_lowercase();
+    if output.status.success()
+        && ![
+            "failed",
+            "not available",
+            "not supported",
+            "not connected",
+            "invalid command",
+            "unknown command",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Ok(());
+    }
+    let detail = detail.trim().to_owned();
+    Err(if detail.is_empty() {
+        format!("bluetoothctl завершился с кодом {}", output.status)
+    } else {
+        detail
+    })
+}
+
+fn read_bluetooth_connected() -> Option<String> {
+    let output = Command::new("/usr/bin/bluealsa-aplay")
+        .arg("--list-devices")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut device_list = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.contains("List of PLAYBACK Bluetooth Devices")
+            || line.contains("List of CAPTURE Bluetooth Devices")
+        {
+            device_list = true;
+            continue;
+        }
+        if device_list && !line.is_empty() && !line.starts_with('*') {
+            return Some("Bluetooth-устройство".into());
+        }
+    }
+    None
+}
+
+fn read_bluetooth_capture_source() -> Option<String> {
+    let output = Command::new("/usr/bin/bluealsa-aplay")
+        .arg("--list-devices")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut capture_devices = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.contains("List of PLAYBACK Bluetooth Devices") {
+            capture_devices = false;
+            continue;
+        }
+        if line.contains("List of CAPTURE Bluetooth Devices") {
+            capture_devices = true;
+            continue;
+        }
+        if capture_devices && line.starts_with("hci") {
+            return line
+                .split_once(':')
+                .map(|(_, remainder)| remainder.trim())
+                .and_then(|remainder| remainder.split_whitespace().next())
+                .filter(|address| address.matches(':').count() == 5)
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn read_bluetooth_volume() -> Option<u8> {
+    let output = Command::new("/usr/bin/amixer")
+        .args(["-c", "0", "get", "Bluetooth Master"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let start = line.find('[')? + 1;
+            let end = line[start..].find("%]")? + start;
+            line[start..end].parse::<u8>().ok()
+        })
 }
 
 fn face_brightness(face: &str) -> Result<Vec<(&'static str, u8)>, String> {
@@ -700,6 +1121,9 @@ fn save_time_settings(path: &PathBuf, settings: &TimeSettings) -> Result<(), Str
 fn validate_time_settings(settings: &TimeSettings) -> Result<(), String> {
     if settings.clock_brightness_percent > 100 {
         return Err("Яркость экрана часов должна быть от 0 до 100 процентов".into());
+    }
+    if settings.output_volume_percent > 100 {
+        return Err("Громкость должна быть от 0 до 100 процентов".into());
     }
     if !(-720..=840).contains(&settings.utc_offset_minutes) || settings.utc_offset_minutes % 15 != 0
     {

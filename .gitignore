@@ -4,12 +4,18 @@
 # Runtime credentials and local configuration
 auth.json
 config.json
+schedules.json
 .env
 .env.*
 !.env.example
 
 # Local device/build output and logs
 /dist/
+/training/corpus/
+/training/jobs/
+/training/reports/
+/training/models/
+/training/.venv/
 *.log
 *.pid
 *.tmp
@@ -22,3 +28,7 @@ id_*
 *.key
 *.p12
 *.pfx
+
+# Python caches
+__pycache__/
+*.py[cod]

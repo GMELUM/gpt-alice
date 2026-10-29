@@ -1,0 +1,2 @@
+# Phonetically identical/near-identical utterances: measure separately before using for training.
+а лиса
