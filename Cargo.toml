@@ -1,7 +1,7 @@
 [package]
 name = "gpt-alice"
 default-run = "gpt-alice"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Local web interface and Rust runtime for a smart speaker"
 license = "MIT"
