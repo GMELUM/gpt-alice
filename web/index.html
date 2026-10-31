@@ -143,6 +143,8 @@
       .time-field select, .time-field input { width: 100%; padding: 0 10px; }
       .time-current { margin-top: 14px; color: #565c68; font-size: 12px; line-height: 1.6; }
       .time-detail { margin-top: 6px; color: var(--muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .vpn-config { display: block; width: 100%; min-height: 190px; margin-top: 12px; padding: 12px; color: #252832; background: #fbfbfc; border: 1px solid var(--line); border-radius: 10px; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+      .context-textarea { display: block; width: 100%; min-height: 150px; margin-top: 12px; padding: 12px; color: #252832; background: #fbfbfc; border: 1px solid var(--line); border-radius: 10px; font: 12px/1.55 system-ui, sans-serif; resize: vertical; }
       footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 34px; padding-top: 16px; color: #9297a1; border-top: 1px solid var(--line); font-size: 10px; }
 
       @media (max-width: 760px) {
@@ -244,6 +246,16 @@
           <div class="runtime-output" id="voice-log" role="log" aria-live="polite">Журнал звонка загрузится после подключения.</div>
         </section>
 
+        <section class="runtime-card" aria-label="Память о собеседнике">
+          <h3>Контекст между звонками</h3>
+          <p>После ответов GPT приложение просит модель выбрать только устойчивые сведения, полезные для будущих разговоров: имя, страну или город, интересы и стиль общения. При приближении к лимиту модель объединит и сократит записи, сохранив самое полезное. Профиль автоматически передаётся агенту при следующем звонке.</p>
+          <label class="time-field" for="user-context">Профиль пользователя</label>
+          <textarea id="user-context" class="context-textarea" rows="7" maxlength="5000" placeholder="Пока пусто. Например: Как обращаться: …\nГород и страна: …\nИнтересы: …\nСтиль общения: …\nТекущие проекты: …"></textarea>
+          <div class="button-row"><button class="action-button" id="user-context-save" type="button">Сохранить профиль</button></div>
+          <div class="indicator-status" id="user-context-status" role="status" aria-live="polite"></div>
+          <p class="small">Можно поправить или дописать профиль вручную. Не добавляй пароли, токены, точный адрес и другие секретные данные. Файл хранится рядом с приложением; профиль передаётся GPT-Live в новых звонках, а последние реплики — Codex OAuth для отбора важных фактов. Панель доступна в локальной сети без авторизации.</p>
+        </section>
+
         <section class="runtime-card" aria-label="Bluetooth-колонка">
           <h3>Bluetooth-колонка</h3>
           <p>Включи режим сопряжения и выбери Mini 3 в Bluetooth-настройках телефона. Музыка будет играть через динамики колонки; когда GPT говорит, музыка плавно становится тише.</p>
@@ -256,6 +268,22 @@
           <div class="control-row"><label for="bluetooth-volume">Громкость музыки</label><input id="bluetooth-volume" type="range" min="0" max="100" value="88" /><output id="bluetooth-volume-value">88%</output></div>
           <div class="button-row"><button class="action-button secondary" data-bt-action="play" type="button">Продолжить</button><button class="action-button secondary" data-bt-action="pause" type="button">Пауза</button><button class="action-button secondary" data-bt-action="previous" type="button">Назад</button><button class="action-button secondary" data-bt-action="next" type="button">Вперёд</button></div>
           <div class="indicator-status" id="bluetooth-status" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="runtime-card" aria-label="VPN AmneziaWG">
+          <h3>VPN · AmneziaWG</h3>
+          <p>Подключение запускается после синхронизации времени. При замене активного конфига VPN переподключится автоматически.</p>
+          <div class="runtime-row"><span class="runtime-pill" id="vpn-state">Проверка VPN…</span></div>
+          <label class="trigger-toggle" for="vpn-toggle">
+            <span class="trigger-toggle-copy">Включить VPN<small>Использовать VPN как основной маршрут колонки.</small></span>
+            <input id="vpn-toggle" type="checkbox" role="switch" />
+            <span class="trigger-switch" aria-hidden="true"></span>
+          </label>
+          <div class="indicator-status" id="vpn-status" role="status" aria-live="polite"></div>
+          <label class="time-field" for="vpn-config">Новая конфигурация AmneziaWG</label>
+          <textarea id="vpn-config" class="vpn-config" rows="9" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Вставь полный конфиг с секциями [Interface] и [Peer]"></textarea>
+          <div class="button-row"><button class="action-button" id="vpn-config-save" type="button">Заменить конфигурацию</button></div>
+          <p class="small">В конфиге есть приватный ключ. Веб-панель работает без авторизации по HTTP — используй только доверенную домашнюю сеть. Колонка не возвращает сохранённый конфиг в браузер; файл хранится на устройстве с ограниченными правами.</p>
         </section>
 
         <div class="section-heading"><h2>Индикаторы</h2><span>Управление кольцом и LED-часами</span></div>
@@ -433,6 +461,45 @@
         catch (error) { setStatus(voiceStatus, error.message, true); }
         await refreshVoice();
       });
+      const userContext = document.querySelector("#user-context");
+      const userContextStatus = document.querySelector("#user-context-status");
+      const userContextSave = document.querySelector("#user-context-save");
+      let userContextRevision = 0;
+      let userContextDirty = false;
+      userContext.addEventListener("input", () => { userContextDirty = true; });
+      async function refreshUserContext() {
+        if (userContextDirty) return;
+        try {
+          const response = await fetch("/api/context", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.message || `Ошибка HTTP ${response.status}`);
+          const changed = userContextRevision !== 0 && data.revision !== userContextRevision;
+          userContextRevision = data.revision;
+          userContext.value = data.text || "";
+          const updated = data.updated_at_unix ? new Date(data.updated_at_unix * 1000).toLocaleString() : "ещё не обновлялся";
+          setStatus(userContextStatus, changed ? `Профиль обновлён после разговора · ${updated}` : `Последнее изменение: ${updated}`);
+        } catch (error) { setStatus(userContextStatus, `Не удалось загрузить профиль: ${error.message}`, true); }
+      }
+      userContextSave.addEventListener("click", async () => {
+        userContextSave.disabled = true;
+        try {
+          const response = await fetch("/api/context", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: userContext.value, revision: userContextRevision }),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.message || `Ошибка HTTP ${response.status}`);
+          userContextRevision = data.revision;
+          userContext.value = data.text || "";
+          userContextDirty = false;
+          const updated = data.updated_at_unix ? new Date(data.updated_at_unix * 1000).toLocaleString() : "сейчас";
+          setStatus(userContextStatus, `Профиль сохранён · ${updated}`);
+        } catch (error) { setStatus(userContextStatus, error.message, true); }
+        finally { userContextSave.disabled = false; }
+      });
+      refreshUserContext();
+      setInterval(refreshUserContext, 10000);
       const triggerToggle = document.querySelector("#trigger-call-toggle");
       const triggerStatus = document.querySelector("#trigger-status");
       async function refreshWakeWord() {
@@ -498,6 +565,65 @@
         catch (error) { setStatus(bluetoothStatus, error.message, true); }
         finally { button.disabled = false; }
       }));
+
+      const vpnToggle = document.querySelector("#vpn-toggle");
+      const vpnState = document.querySelector("#vpn-state");
+      const vpnStatus = document.querySelector("#vpn-status");
+      const vpnConfig = document.querySelector("#vpn-config");
+      async function refreshVpn() {
+        try {
+          const response = await fetch("/api/vpn", { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.message || `Ошибка HTTP ${response.status}`);
+          vpnToggle.checked = data.enabled === true;
+          vpnToggle.disabled = !data.available;
+          vpnState.textContent = data.message;
+          if (data.last_handshake_seconds_ago !== null && data.last_handshake_seconds_ago !== undefined) {
+            vpnState.textContent += ` · рукопожатие ${data.last_handshake_seconds_ago} с назад`;
+          }
+          if (!data.configured && !vpnStatus.textContent) setStatus(vpnStatus, "Сначала вставь и сохрани конфигурацию AmneziaWG.");
+        } catch (error) {
+          vpnToggle.disabled = true;
+          vpnState.textContent = "Не удалось прочитать состояние VPN";
+          setStatus(vpnStatus, error.message, true);
+        }
+      }
+      vpnToggle.addEventListener("change", async () => {
+        const enabled = vpnToggle.checked;
+        vpnToggle.disabled = true;
+        setStatus(vpnStatus, enabled ? "Подключаю VPN…" : "Выключаю VPN…");
+        try {
+          setStatus(vpnStatus, await postJson("/api/vpn/power", { enabled }));
+          await refreshVpn();
+        } catch (error) {
+          vpnToggle.checked = !enabled;
+          setStatus(vpnStatus, error.message, true);
+        } finally { vpnToggle.disabled = false; }
+      });
+      document.querySelector("#vpn-config-save").addEventListener("click", async event => {
+        const button = event.currentTarget;
+        const config = vpnConfig.value;
+        if (!config.trim()) {
+          setStatus(vpnStatus, "Вставь полный конфиг перед заменой.", true);
+          return;
+        }
+        button.disabled = true;
+        vpnToggle.disabled = true;
+        setStatus(vpnStatus, "Проверяю конфиг и переподключаю VPN…");
+        try {
+          setStatus(vpnStatus, await postJson("/api/vpn/config", { config }));
+          vpnConfig.value = "";
+          await refreshVpn();
+        } catch (error) {
+          setStatus(vpnStatus, error.message, true);
+        } finally {
+          button.disabled = false;
+          vpnToggle.disabled = false;
+        }
+      });
+      refreshVpn();
+      setInterval(refreshVpn, 5000);
+
       function describeEvent(event) {
         if (!event) return "Нажмите кнопку громкости или центральную кнопку на колонке.";
         if (event.type === "button") return `Кнопка: ${event.button}, ${event.action}, ${event.key_name} (${event.key_code})`;

@@ -102,6 +102,7 @@ impl Scheduler {
                 };
                 runtime.set_timer_display(remaining);
                 for (kind, label, text) in due {
+                    runtime.indicators().set_alarm_active(true);
                     let title = label
                         .map(|label| format!("{kind} «{label}»"))
                         .unwrap_or_else(|| kind.to_owned());
@@ -117,6 +118,7 @@ impl Scheduler {
                             ))
                             .await;
                     }
+                    runtime.indicators().set_alarm_active(false);
                 }
             }
         });

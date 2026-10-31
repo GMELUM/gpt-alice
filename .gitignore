@@ -5,6 +5,7 @@
 auth.json
 config.json
 schedules.json
+conversation_context.json
 .env
 .env.*
 !.env.example

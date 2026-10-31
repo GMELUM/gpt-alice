@@ -23,13 +23,24 @@ stop() {
   running=$(pidof gpt-alice 2>/dev/null || true)
   [ -n "$running" ] || { rm -f "$PIDFILE"; return 0; }
   kill $running 2>/dev/null || return 1
+  attempt=0
+  while [ "$attempt" -lt 10 ]; do
+    running=$(pidof gpt-alice 2>/dev/null || true)
+    [ -z "$running" ] && break
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  if [ -n "$running" ]; then
+    echo "gpt-alice: process did not stop" >&2
+    return 1
+  fi
   rm -f "$PIDFILE"
 }
 
 case "$1" in
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 1; start ;;
+  restart) stop; start ;;
   status)
     running=$(pidof gpt-alice 2>/dev/null || true)
     if [ -n "$running" ]; then echo "gpt-alice running: $running"; else echo "gpt-alice stopped"; fi

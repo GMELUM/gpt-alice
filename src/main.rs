@@ -18,7 +18,9 @@ mod oauth;
 mod runtime;
 mod scheduler;
 mod training;
+mod user_context;
 mod voice;
+mod vpn;
 mod web_search;
 
 use audio::AudioController;
@@ -243,16 +245,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let indicators = Arc::new(IndicatorController::new());
     let mixer = Arc::new(mixer::AudioMixer::start().map_err(std::io::Error::other)?);
+    let user_context = user_context::UserContextController::new_near_executable();
     let runtime = Arc::new(RuntimeController::new(
         Arc::clone(&indicators),
         Arc::clone(&mixer),
     ));
     let scheduler = scheduler::Scheduler::new();
     let audio = AudioController::new(Arc::clone(&mixer));
-    let voice = voice::VoiceController::new(indicators, Arc::clone(&runtime), scheduler.clone())
-        .map_err(std::io::Error::other)?;
+    let voice = voice::VoiceController::new(
+        indicators,
+        Arc::clone(&runtime),
+        scheduler.clone(),
+        user_context.clone(),
+    )
+    .map_err(std::io::Error::other)?;
     scheduler.start(Arc::clone(&runtime), voice.clone());
     let wakeword = WakeWordController::new();
+    let vpn = vpn::VpnController::new();
     let training_recorder = training::DeviceRecorder::default();
     let voice_button = voice.clone();
     let oauth_button = oauth.clone();
@@ -339,6 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/bluetooth/power", post(set_bluetooth_enabled))
         .route("/api/bluetooth/volume", post(set_bluetooth_volume))
         .route("/api/bluetooth/playback", post(bluetooth_playback))
+        .route("/api/vpn", get(vpn::get_status))
+        .route("/api/vpn/power", post(vpn::set_power))
+        .route("/api/vpn/config", post(vpn::replace_config))
         .route("/api/time", get(time_status).post(update_time_settings))
         .route("/api/display/face", post(show_face))
         .route("/api/auth/status", get(oauth::get_status))
@@ -348,6 +360,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/voice/silence", get(voice::get_silence_status))
         .route("/api/voice/logs", get(voice::get_logs))
         .route("/api/voice/toggle", post(toggle_voice))
+        .route(
+            "/api/context",
+            get(user_context::get_profile).post(user_context::update_profile),
+        )
         .route("/api/wakeword", get(wakeword_status).post(update_wakeword))
         .route("/api/training/capture/start", post(start_training_capture))
         .route(
@@ -360,7 +376,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .layer(axum::Extension(training_recorder))
         .layer(axum::Extension(voice))
+        .layer(axum::Extension(user_context))
         .layer(axum::Extension(wakeword))
+        .layer(axum::Extension(vpn))
         .layer(axum::Extension(oauth))
         .with_state(runtime);
     axum::serve(listener, app).await?;

@@ -13,6 +13,8 @@ const FRAMEBUFFER: &str = "/dev/fb0";
 const FRAMEBUFFER_BYTES: usize = 18;
 const VOICE_IDLE_COLOR: [u8; 3] = [0x0f, 0x00, 0x0f];
 const VOICE_ACTIVE_COLOR: [u8; 3] = [0xff, 0x00, 0xff];
+const SEARCH_COLOR: [u8; 3] = [0xff, 0xc0, 0x00];
+const BLUETOOTH_COLOR: [u8; 3] = [0x00, 0x40, 0xff];
 const LED_ROOT: &str = "/sys/class/leds/bergamot:white:clock";
 const CLOCK_SEGMENTS: [&str; 32] = [
     "A0", "A1", "A2", "A3", "B0", "B1", "B2", "B3", "C0", "C1", "C2", "C3", "D0", "D1", "D2", "D3",
@@ -25,6 +27,18 @@ pub struct IndicatorController {
     initial_frame: Arc<Mutex<Option<[u8; FRAMEBUFFER_BYTES]>>>,
     display: Arc<Mutex<DisplayState>>,
     clock_brightness: Arc<Mutex<u8>>,
+    ring_state: Arc<Mutex<RingState>>,
+    web_search_count: Arc<std::sync::atomic::AtomicUsize>,
+    colon_lit: Arc<Mutex<Option<bool>>>,
+    colon_should_lit: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct RingState {
+    call_active: bool,
+    bluetooth_last_audio: Option<std::time::Instant>,
+    muted: bool,
+    alarm_active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +78,10 @@ impl IndicatorController {
             initial_frame: Arc::new(Mutex::new(initial_frame)),
             display: Arc::new(Mutex::new(DisplayState::Clock)),
             clock_brightness: Arc::new(Mutex::new(150)),
+            ring_state: Arc::new(Mutex::new(RingState::default())),
+            web_search_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            colon_lit: Arc::new(Mutex::new(None)),
+            colon_should_lit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -121,30 +139,150 @@ impl IndicatorController {
     }
 
     pub fn render_voice_idle(&self) -> Result<(), String> {
+        if let Ok(mut state) = self.ring_state.lock() {
+            state.call_active = false;
+        }
+        self.render_ring_frame(0)
+    }
+
+    pub fn set_voice_call_active(&self, active: bool) {
+        if let Ok(mut state) = self.ring_state.lock() {
+            state.call_active = active;
+        }
+    }
+
+    /// Mark a client web search as active. A counter allows overlapping calls to
+    /// finish independently without restoring the call color too early.
+    pub fn set_web_search_active(&self, active: bool) {
+        use std::sync::atomic::Ordering;
+        if active {
+            self.web_search_count.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let mut current = self.web_search_count.load(Ordering::Acquire);
+            while current > 0 {
+                match self.web_search_count.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+    }
+
+    pub fn mark_bluetooth_audio(&self) {
+        if let Ok(mut state) = self.ring_state.lock() {
+            state.bluetooth_last_audio = Some(std::time::Instant::now());
+        }
+    }
+
+    pub fn set_microphone_muted(&self, muted: bool) {
+        if let Ok(mut state) = self.ring_state.lock() {
+            state.muted = muted;
+        }
+    }
+
+    pub fn set_alarm_active(&self, active: bool) {
+        if let Ok(mut state) = self.ring_state.lock() {
+            state.alarm_active = active;
+        }
+    }
+
+    /// Render the current ring state. Priority: alarm, microphone mute, search,
+    /// live conversation, active Bluetooth stream, then the dim idle color.
+    pub fn render_ring_frame(&self, phase: usize) -> Result<(), String> {
+        let state = self
+            .ring_state
+            .lock()
+            .map_err(|_| "Не удалось получить состояние кольца".to_owned())?;
+        let searching = self
+            .web_search_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        let bluetooth_active = state
+            .bluetooth_last_audio
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(700));
+        let alarm = state.alarm_active;
+        let color = if alarm {
+            [0xff, 0x00, 0x00]
+        } else if state.muted {
+            [0xff, 0x50, 0x00]
+        } else if searching {
+            SEARCH_COLOR
+        } else if state.call_active {
+            VOICE_ACTIVE_COLOR
+        } else if bluetooth_active {
+            BLUETOOTH_COLOR
+        } else {
+            VOICE_IDLE_COLOR
+        };
+        let animated = state.alarm_active || searching || state.call_active || bluetooth_active;
+        let dim = if alarm && phase % 2 == 1 {
+            [0x20, 0x00, 0x00]
+        } else if searching {
+            [0x20, 0x18, 0x00]
+        } else if state.call_active && !searching {
+            VOICE_IDLE_COLOR
+        } else if bluetooth_active && !searching {
+            [0x00, 0x08, 0x20]
+        } else {
+            color
+        };
+        drop(state);
         let mut frame = [0_u8; FRAMEBUFFER_BYTES];
-        for pixel in frame.chunks_exact_mut(3) {
-            pixel.copy_from_slice(&[
-                VOICE_IDLE_COLOR[2],
-                VOICE_IDLE_COLOR[1],
-                VOICE_IDLE_COLOR[0],
-            ]);
+        for (index, pixel) in frame.chunks_exact_mut(3).enumerate() {
+            let pixel_color = if animated && index == phase % 6 {
+                color
+            } else {
+                dim
+            };
+            // Mini 3 framebuffer pixels are BGR.
+            pixel.copy_from_slice(&[pixel_color[2], pixel_color[1], pixel_color[0]]);
         }
         write_frame(&frame)
     }
 
-    /// Draw a rotating bright pink pixel over the dim pink call-idle background.
-    pub fn render_voice_active_frame(&self, bright_pixel: usize) -> Result<(), String> {
-        let mut frame = [0_u8; FRAMEBUFFER_BYTES];
-        for (index, pixel) in frame.chunks_exact_mut(3).enumerate() {
-            let color = if index == bright_pixel % 6 {
-                VOICE_ACTIVE_COLOR
-            } else {
-                VOICE_IDLE_COLOR
-            };
-            // Mini 3 framebuffer pixels are BGR.
-            pixel.copy_from_slice(&[color[2], color[1], color[0]]);
+    /// Update only the two clock separator LEDs at 2 Hz; avoid repainting the
+    /// full 32-segment display on every blink tick.
+    pub fn refresh_clock_separator(&self) -> Result<(), String> {
+        let display = *self
+            .display
+            .lock()
+            .map_err(|_| "Не удалось получить состояние дисплея".to_owned())?;
+        if !matches!(display, DisplayState::Clock | DisplayState::Timer) {
+            return Ok(());
         }
-        write_frame(&frame)
+        let lit = self
+            .colon_should_lit
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut previous = self
+            .colon_lit
+            .lock()
+            .map_err(|_| "Не удалось получить состояние двоеточия".to_owned())?;
+        if *previous == Some(lit) {
+            return Ok(());
+        }
+        let brightness = if lit {
+            self.clock_brightness
+                .lock()
+                .map(|value| *value)
+                .unwrap_or(150)
+        } else {
+            0
+        };
+        self.write_clock_brightness("DH", brightness)?;
+        self.write_clock_brightness("DL", brightness)?;
+        *previous = Some(lit);
+        Ok(())
+    }
+
+    pub fn advance_clock_separator(&self) -> Result<(), String> {
+        self.colon_should_lit
+            .fetch_xor(true, std::sync::atomic::Ordering::AcqRel);
+        self.refresh_clock_separator()
     }
 
     pub fn set_clock_brightness(
@@ -224,6 +362,10 @@ impl IndicatorController {
             .display
             .lock()
             .map_err(|_| "Не удалось получить состояние дисплея".to_owned())? = DisplayState::Face;
+        *self
+            .colon_lit
+            .lock()
+            .map_err(|_| "Не удалось получить состояние двоеточия".to_owned())? = None;
         Ok(())
     }
 
@@ -265,8 +407,6 @@ impl IndicatorController {
                 }
             }
         }
-        lit.push(("DH".to_owned(), brightness));
-        lit.push(("DL".to_owned(), brightness));
         let lit: Vec<(&'static str, u8)> = lit
             .into_iter()
             .filter_map(|(id, b)| {
@@ -281,7 +421,7 @@ impl IndicatorController {
             .display
             .lock()
             .map_err(|_| "Не удалось получить состояние дисплея".to_owned())? = DisplayState::Clock;
-        Ok(())
+        self.refresh_clock_separator()
     }
 
     pub fn render_volume(&self, volume: u8) -> Result<(), String> {
@@ -330,14 +470,12 @@ impl IndicatorController {
                 }
             }
         }
-        lit.push(("DH", brightness));
-        lit.push(("DL", brightness));
         self.render_face(lit)?;
         *self
             .display
             .lock()
             .map_err(|_| "Не удалось получить состояние дисплея".to_owned())? = DisplayState::Timer;
-        Ok(())
+        self.refresh_clock_separator()
     }
 
     pub fn refresh_display(&self, utc_offset_minutes: i16) -> Result<(), String> {

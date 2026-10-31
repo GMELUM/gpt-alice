@@ -262,7 +262,11 @@ impl RuntimeController {
             .time_settings
             .clone();
         let _ = save_time_settings(&config_path, &settings);
-        Self::bluetooth_audio_bridge_loop(Arc::clone(&self.state), Arc::clone(&self.audio_mixer));
+        Self::bluetooth_audio_bridge_loop(
+            Arc::clone(&self.state),
+            Arc::clone(&self.audio_mixer),
+            Arc::clone(&self.indicators),
+        );
         let startup_servers = settings.ntp_servers.clone();
         thread::Builder::new()
             .name("ntp-sources".into())
@@ -271,6 +275,36 @@ impl RuntimeController {
             })
             .expect("failed to start NTP source configuration");
         let _ = indicators.render_idle_clock(settings.utc_offset_minutes);
+        let ring_state = Arc::clone(&state);
+        let ring_indicators = Arc::clone(&indicators);
+        thread::Builder::new()
+            .name("ring-status".into())
+            .spawn(move || {
+                let mut phase = 0;
+                loop {
+                    let muted = ring_state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.microphone_muted)
+                        .unwrap_or(false);
+                    ring_indicators.set_microphone_muted(muted);
+                    let _ = ring_indicators.render_ring_frame(phase);
+                    phase = (phase + 1) % 6;
+                    thread::sleep(Duration::from_millis(150));
+                }
+            })
+            .expect("failed to start ring status renderer");
+        let separator_indicators = Arc::clone(&indicators);
+        thread::Builder::new()
+            .name("clock-separator".into())
+            .spawn(move || {
+                let _ = separator_indicators.refresh_clock_separator();
+                loop {
+                    thread::sleep(Duration::from_millis(500));
+                    let _ = separator_indicators.advance_clock_separator();
+                }
+            })
+            .expect("failed to start clock separator renderer");
         thread::Builder::new()
             .name("display-idle".into())
             .spawn(move || {
@@ -313,14 +347,6 @@ impl RuntimeController {
                     } else if idle {
                         if let Some(seconds) = timer_remaining {
                             let _ = indicators.render_timer_countdown(seconds);
-                        } else if SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            % 60
-                            == 0
-                        {
-                            let _ = indicators.render_idle_clock(offset);
                         }
                     }
                 }
@@ -771,7 +797,11 @@ impl RuntimeController {
             .ok();
     }
 
-    fn bluetooth_audio_bridge_loop(state: Arc<Mutex<State>>, mixer: Arc<AudioMixer>) {
+    fn bluetooth_audio_bridge_loop(
+        state: Arc<Mutex<State>>,
+        mixer: Arc<AudioMixer>,
+        indicators: Arc<crate::indicators::IndicatorController>,
+    ) {
         thread::Builder::new()
             .name("bluetooth-audio-bridge".into())
             .spawn(move || {
@@ -818,6 +848,7 @@ impl RuntimeController {
                             address,
                             Arc::clone(&state),
                             Arc::clone(&mixer),
+                            Arc::clone(&indicators),
                         ) {
                             Ok(started) => {
                                 eprintln!("Bluetooth A2DP audio bridge started");
@@ -847,6 +878,7 @@ impl BluetoothAudioBridge {
         address: String,
         state: Arc<Mutex<State>>,
         mixer: Arc<AudioMixer>,
+        indicators: Arc<crate::indicators::IndicatorController>,
     ) -> Result<Self, String> {
         let mut capture_command = Command::new("/usr/bin/arecord");
         capture_command
@@ -889,6 +921,7 @@ impl BluetoothAudioBridge {
                     };
                     let gain = f32::from(volume) * duck_gain / 100.0;
                     mixer.push_bluetooth(&samples, gain);
+                    indicators.mark_bluetooth_audio();
                 }
             })
             .map_err(|error| format!("не удалось запустить аудиомикшер Bluetooth: {error}"))?;

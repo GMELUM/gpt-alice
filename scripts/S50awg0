@@ -1,0 +1,219 @@
+#!/bin/sh
+# Start the AmneziaWG userspace tunnel after Wi-Fi/DHCP and NTP sync. Keep
+# credentials in the device-only runtime config under /data/opt/gpt-alice/tools.
+
+TOOLS=/data/opt/gpt-alice/tools
+CONF=$TOOLS/awg0.conf
+AWG=$TOOLS/awg
+AWG_GO=$TOOLS/amneziawg-go
+IFACE=awg0
+PIDFILE=$TOOLS/awg0.pid
+LOG=$TOOLS/awg0.log
+RESOLV=/tmp/resolv.conf
+RESOLV_BACKUP=$TOOLS/resolv.conf.before-awg0
+RESOLV_HEAD=/data/resolv.conf.head
+RESOLV_HEAD_BACKUP=$TOOLS/resolv.conf.head.before-awg0
+RESOLV_HEAD_MISSING=$TOOLS/resolv.conf.head.was-missing
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"
+}
+
+has_interface() {
+  "$AWG" show interfaces 2>/dev/null | tr ' ' '\n' | grep -qx "$IFACE"
+}
+
+start_tunnel() {
+  [ -x "$AWG" ] && [ -x "$AWG_GO" ] && [ -r "$CONF" ] || {
+    log 'VPN tools or config missing'
+    return 1
+  }
+
+  if has_interface; then
+    log 'awg0 already exists'
+    return 0
+  fi
+
+  i=0
+  GW=
+  DEV=
+  while [ "$i" -lt 30 ]; do
+    set -- $(ip route 2>/dev/null | awk '$1 == "default" { print $3, $5; exit }')
+    GW=${1:-}
+    DEV=${2:-}
+    [ -n "$GW" ] && [ -n "$DEV" ] && break
+    i=$((i + 1))
+    sleep 1
+  done
+  [ -n "$GW" ] && [ -n "$DEV" ] || {
+    log 'No DHCP default route; VPN start deferred'
+    return 1
+  }
+
+  # chronyd starts at S49 and can need several seconds to correct the clock.
+  # Starting WireGuard before that may make the server reject stale timestamps.
+  i=0
+  while [ "$i" -lt 45 ]; do
+    if /usr/bin/chronyc tracking 2>/dev/null | grep -q 'Leap status.*Normal'; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  if ! /usr/bin/chronyc tracking 2>/dev/null | grep -q 'Leap status.*Normal'; then
+    log 'Chrony is not synchronized; leaving Wi-Fi default route active'
+    return 1
+  fi
+
+  # dhcpcd starts asynchronously and may write its resolver file just after
+  # the default route appears. Let its initial lease settle before saving DNS.
+  sleep 3
+
+  ENDPOINT=$(awk -F'[ =:]+' '$1 == "Endpoint" { print $2; exit }' "$CONF")
+  ADDRESS=$(awk -F' *= *' '$1 == "Address" { print $2; exit }' "$CONF")
+  DNS=$(awk -F' *= *' '$1 == "DNS" { print $2; exit }' "$CONF")
+  [ -n "$ENDPOINT" ] && [ -n "$ADDRESS" ] && [ -n "$DNS" ] || {
+    log 'VPN config is missing Endpoint, Address, or DNS'
+    return 1
+  }
+
+  mkdir -p "$TOOLS"
+  [ ! -r "$RESOLV" ] || cp -p "$RESOLV" "$RESOLV_BACKUP"
+  umask 077
+  awk '!/^[[:space:]]*(Address|DNS)[[:space:]]*=/' "$CONF" > /tmp/awg0.setconf
+
+  # Keep the UDP endpoint on Wi-Fi so installing the tunnel default route
+  # cannot route its own encrypted transport back into awg0.
+  ip route replace "$ENDPOINT/32" via "$GW" dev "$DEV" || return 1
+
+  WG_PROCESS_FOREGROUND=1 "$AWG_GO" -f "$IFACE" >>"$LOG" 2>&1 </dev/null &
+  echo $! > "$PIDFILE"
+
+  i=0
+  while [ "$i" -lt 10 ] && ! has_interface; do
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      log 'AmneziaWG userspace process exited before creating awg0'
+      rm -f "$PIDFILE" /tmp/awg0.setconf
+      ip route del "$ENDPOINT/32" 2>/dev/null || true
+      return 1
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  if ! has_interface; then
+    log 'Timed out waiting for awg0 interface'
+    stop_tunnel
+    return 1
+  fi
+
+  if ! "$AWG" setconf "$IFACE" /tmp/awg0.setconf >>"$LOG" 2>&1; then
+    log 'awg setconf failed'
+    stop_tunnel
+    return 1
+  fi
+  rm -f /tmp/awg0.setconf
+
+  if ! ip addr add "$ADDRESS" dev "$IFACE" || ! ip link set "$IFACE" up; then
+    log 'Failed to assign VPN address or bring awg0 up'
+    stop_tunnel
+    return 1
+  fi
+
+  if ! ip route replace default dev "$IFACE" metric 50; then
+    log 'Failed to set VPN default route'
+    stop_tunnel
+    return 1
+  fi
+  old_ifs=$IFS
+  IFS=,
+  set -- $DNS
+  IFS=$old_ifs
+  DNS1=$(printf '%s' "${1:-}" | tr -d ' ')
+  DNS2=$(printf '%s' "${2:-}" | tr -d ' ')
+  if [ ! -f "$RESOLV_HEAD_BACKUP" ] && [ ! -f "$RESOLV_HEAD_MISSING" ]; then
+    if [ -e "$RESOLV_HEAD" ]; then
+      cp -p "$RESOLV_HEAD" "$RESOLV_HEAD_BACKUP"
+    else
+      : > "$RESOLV_HEAD_MISSING"
+    fi
+  fi
+  {
+    [ -z "$DNS1" ] || echo "nameserver $DNS1"
+    [ -z "$DNS2" ] || echo "nameserver $DNS2"
+  } > "$RESOLV_HEAD"
+  [ -z "$DNS1" ] || ip route replace "$DNS1/32" dev "$IFACE"
+  [ -z "$DNS2" ] || ip route replace "$DNS2/32" dev "$IFACE"
+
+  {
+    echo '# Managed by S50awg0'
+    [ -z "$DNS1" ] || echo "nameserver $DNS1"
+    [ -z "$DNS2" ] || echo "nameserver $DNS2"
+  } > "$RESOLV"
+
+  # Generate traffic to initiate the peer handshake, then record its status.
+  ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 15 ]; do
+    HANDSHAKE=$("$AWG" show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
+    if [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" -gt 0 ] 2>/dev/null; then
+      log 'VPN started; peer handshake received'
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+
+  log 'VPN interface started but no peer handshake yet; keeping it up for retry'
+  return 0
+}
+
+stop_tunnel() {
+  ENDPOINT=$(awk -F'[ =:]+' '$1 == "Endpoint" { print $2; exit }' "$CONF" 2>/dev/null)
+  DNS=$(awk -F' *= *' '$1 == "DNS" { print $2; exit }' "$CONF" 2>/dev/null)
+  ip route del default dev "$IFACE" metric 50 2>/dev/null || true
+  old_ifs=$IFS
+  IFS=,
+  set -- $DNS
+  IFS=$old_ifs
+  DNS1=$(printf '%s' "${1:-}" | tr -d ' ')
+  DNS2=$(printf '%s' "${2:-}" | tr -d ' ')
+  [ -z "$DNS1" ] || ip route del "$DNS1/32" dev "$IFACE" 2>/dev/null || true
+  [ -z "$DNS2" ] || ip route del "$DNS2/32" dev "$IFACE" 2>/dev/null || true
+  [ -z "$ENDPOINT" ] || ip route del "$ENDPOINT/32" 2>/dev/null || true
+  if [ -f "$RESOLV_HEAD_MISSING" ]; then
+    rm -f "$RESOLV_HEAD" "$RESOLV_HEAD_MISSING"
+  elif [ -f "$RESOLV_HEAD_BACKUP" ]; then
+    cp -p "$RESOLV_HEAD_BACKUP" "$RESOLV_HEAD"
+    rm -f "$RESOLV_HEAD_BACKUP"
+  fi
+  [ ! -r "$RESOLV_BACKUP" ] || cp -p "$RESOLV_BACKUP" "$RESOLV"
+
+  if [ -r "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE")
+    CMD=$(tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null)
+    case "$CMD" in
+      *"$AWG_GO -f $IFACE"*) kill "$PID" 2>/dev/null || true ;;
+    esac
+  fi
+  ip link del "$IFACE" 2>/dev/null || true
+  rm -f "$PIDFILE" /tmp/awg0.setconf
+  log 'VPN stopped'
+}
+
+status_tunnel() {
+  if has_interface; then
+    echo 'AmneziaWG awg0 is up'
+    "$AWG" show "$IFACE" latest-handshakes 2>/dev/null
+  else
+    echo 'AmneziaWG awg0 is down'
+    return 1
+  fi
+}
+
+case "$1" in
+  start) start_tunnel ;;
+  stop) stop_tunnel ;;
+  restart) stop_tunnel; sleep 1; start_tunnel ;;
+  status) status_tunnel ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
