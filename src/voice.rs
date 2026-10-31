@@ -800,6 +800,18 @@ impl VoiceController {
         .await
     }
 
+    async fn clear_interrupted_playback(&self) -> Result<(), String> {
+        // Clear the app mixer first so its already-received 250 ms voice queue
+        // cannot continue playing while the helper flushes its RTP/PCM buffers.
+        self.runtime.clear_agent_audio();
+        let mut inner = self.inner.lock().await;
+        let session = inner
+            .session
+            .as_mut()
+            .ok_or_else(|| "Аудиосессия уже завершена".to_owned())?;
+        send_command(&mut session.stdin, json!({"type":"clear"})).await
+    }
+
     pub async fn announce_schedule(&self, text: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
         let session = inner
@@ -1443,6 +1455,31 @@ impl VoiceController {
             .await;
             send_command(&mut stdin, json!({"type":"answer", "sdp":answer})).await?;
             wait_for_type(&mut event_rx, "connected", Duration::from_secs(35)).await?;
+            let vad_event_id = uuid::Uuid::new_v4().to_string();
+            send_command(
+                &mut stdin,
+                json!({
+                    "type":"sendEvent",
+                    "event":{
+                        "type":"session.update",
+                        "event_id":vad_event_id,
+                        "session":{
+                            "type":"realtime",
+                            "audio":{"input":{"turn_detection":{
+                                "type":"server_vad",
+                                "threshold":0.5,
+                                "prefix_padding_ms":300,
+                                "silence_duration_ms":500,
+                                "create_response":true,
+                                "interrupt_response":true
+                            }}}
+                        }
+                    }
+                }),
+            )
+            .await?;
+            self.log("включена server VAD для начала речи, перебивания ответа и автоматического продолжения диалога")
+                .await;
             send_command(
                 &mut stdin,
                 json!({
@@ -1663,6 +1700,31 @@ impl VoiceController {
                                 .get("type")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
+                            if matches!(
+                                live_type,
+                                "input_audio_buffer.speech_started"
+                                    | "session.input_audio_buffer.speech_started"
+                            ) {
+                                last_progress = Instant::now();
+                                waiting_for_user = false;
+                                idle_goodbye_started = None;
+                                idle_goodbye_finished = None;
+                                idle_close_sent = false;
+                                assistant_speaking = false;
+                                voice_monitor.runtime.set_agent_speaking(false);
+                                match voice_monitor.clear_interrupted_playback().await {
+                                    Ok(()) => voice_monitor
+                                        .log("VAD обнаружил речь пользователя: ответ GPT остановлен, очередь динамика очищена")
+                                        .await,
+                                    Err(error) => voice_monitor
+                                        .log(format!("VAD обнаружил речь пользователя, но не удалось очистить очередь динамика: {error}"))
+                                        .await,
+                                }
+                            } else if live_type == "session.updated" {
+                                voice_monitor
+                                    .log("GPT-Live подтвердил настройки VAD для перебивания ответа")
+                                    .await;
+                            }
                             let assistant_turn = live_event
                                 .pointer("/turn/role")
                                 .or_else(|| live_event.get("role"))

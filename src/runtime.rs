@@ -772,6 +772,10 @@ impl RuntimeController {
         }
     }
 
+    pub fn clear_agent_audio(&self) {
+        self.audio_mixer.clear_agent_voice();
+    }
+
     fn bluetooth_duck_loop(state: Arc<Mutex<State>>) {
         thread::Builder::new()
             .name("bluetooth-duck".into())

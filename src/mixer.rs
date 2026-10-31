@@ -33,6 +33,7 @@ pub struct AudioMixer {
     sender: SyncSender<Source>,
     bluetooth_gain: Arc<Mutex<f32>>,
     output_volume: Arc<AtomicU8>,
+    clear_agent_voice: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AudioMixer {
@@ -47,14 +48,25 @@ impl AudioMixer {
         let worker_gain = Arc::clone(&bluetooth_gain);
         let output_volume = Arc::new(AtomicU8::new(100));
         let worker_output_volume = Arc::clone(&output_volume);
+        let clear_agent_voice = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_clear_agent_voice = Arc::clone(&clear_agent_voice);
         thread::Builder::new()
             .name("shared-audio-output".into())
-            .spawn(move || run_mixer(socket, receiver, worker_gain, worker_output_volume))
+            .spawn(move || {
+                run_mixer(
+                    socket,
+                    receiver,
+                    worker_gain,
+                    worker_output_volume,
+                    worker_clear_agent_voice,
+                )
+            })
             .map_err(|error| format!("не удалось запустить общий аудиовыход: {error}"))?;
         Ok(Self {
             sender,
             bluetooth_gain,
             output_volume,
+            clear_agent_voice,
         })
     }
 
@@ -91,6 +103,11 @@ impl AudioMixer {
             .map_err(|error| format!("не удалось поставить SFX в аудиомикшер: {error}"))
     }
 
+    /// Immediately discard queued GPT-Live output while keeping Bluetooth audio and SFX.
+    pub fn clear_agent_voice(&self) {
+        self.clear_agent_voice.store(true, Ordering::Release);
+    }
+
     /// Accepts interleaved stereo S16_LE frames from BlueALSA at 44.1 kHz.
     pub fn push_bluetooth(&self, pcm: &[u8], gain: f32) {
         if let Ok(mut current) = self.bluetooth_gain.lock() {
@@ -118,6 +135,7 @@ fn run_mixer(
     receiver: mpsc::Receiver<Source>,
     gain: Arc<Mutex<f32>>,
     output_volume: Arc<AtomicU8>,
+    clear_agent_voice: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut output = match Output::start() {
         Ok(output) => Some(output),
@@ -170,6 +188,13 @@ fn run_mixer(
                     break;
                 }
             }
+        }
+        if clear_agent_voice.swap(false, Ordering::AcqRel) {
+            let discarded_frames = voice.len();
+            voice.clear();
+            eprintln!(
+                "shared audio interruption: discarded {discarded_frames} queued voice frames"
+            );
         }
         let now = Instant::now();
         if now < next {
