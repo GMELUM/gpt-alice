@@ -1464,7 +1464,6 @@ impl VoiceController {
                         "type":"session.update",
                         "event_id":vad_event_id,
                         "session":{
-                            "type":"realtime",
                             "audio":{"input":{"turn_detection":{
                                 "type":"server_vad",
                                 "threshold":0.5,
@@ -1478,7 +1477,7 @@ impl VoiceController {
                 }),
             )
             .await?;
-            self.log("включена server VAD для начала речи, перебивания ответа и автоматического продолжения диалога")
+            self.log("отправлены настройки server VAD для начала речи и перебивания ответа")
                 .await;
             send_command(
                 &mut stdin,
