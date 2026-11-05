@@ -1,6 +1,4 @@
 use std::{
-    env, fs,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -8,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::runtime::RuntimeController;
+use crate::{runtime::RuntimeController, storage::Storage};
 
 const MAX_TIMER_SECONDS: u64 = 99 * 60 + 59;
 
@@ -39,23 +37,25 @@ struct PersistedSchedules {
 #[derive(Clone)]
 pub struct Scheduler {
     data: Arc<Mutex<PersistedSchedules>>,
-    path: PathBuf,
+    storage: Storage,
 }
 
 impl Scheduler {
-    pub fn new() -> Self {
-        let mut path = env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
-        path.push("schedules.json");
-        let data = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        Self {
+    pub fn new(storage: Storage, directory: &std::path::Path) -> Result<Self, String> {
+        storage
+            .import_json::<PersistedSchedules>("schedules", &directory.join("schedules.json"))?;
+        let data = storage.get("schedules")?.unwrap_or_default();
+        Ok(Self {
             data: Arc::new(Mutex::new(data)),
-            path,
+            storage,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(PersistedSchedules::default())),
+            storage: Storage::memory(),
         }
     }
 
@@ -101,25 +101,7 @@ impl Scheduler {
                     (remaining, due)
                 };
                 runtime.set_timer_display(remaining);
-                for (kind, label, text) in due {
-                    runtime.indicators().set_alarm_active(true);
-                    let title = label
-                        .map(|label| format!("{kind} «{label}»"))
-                        .unwrap_or_else(|| kind.to_owned());
-                    let message = text.unwrap_or_else(|| format!("Время. Сработал {title}."));
-                    if let Err(error) = voice.announce_schedule(&message).await {
-                        voice
-                            .log(format!("сработал {title}; озвучивание недоступно: {error}"))
-                            .await;
-                    } else {
-                        voice
-                            .log(format!(
-                                "сработал {title}; сообщение передано в голосовой звонок"
-                            ))
-                            .await;
-                    }
-                    runtime.indicators().set_alarm_active(false);
-                }
+                announce_due(&runtime, &voice, due).await;
             }
         });
     }
@@ -485,12 +467,57 @@ impl Scheduler {
     }
 
     fn persist_locked(&self, data: &PersistedSchedules) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(data)
-            .map_err(|e| format!("Не удалось сериализовать расписание: {e}"))?;
-        let temp = self.path.with_extension("json.tmp");
-        fs::write(&temp, bytes)
-            .map_err(|e| format!("Не удалось записать расписание рядом с программой: {e}"))?;
-        fs::rename(&temp, &self.path).map_err(|e| format!("Не удалось сохранить расписание: {e}"))
+        self.storage.set("schedules", data)
+    }
+}
+
+async fn announce_due(
+    runtime: &RuntimeController,
+    voice: &crate::voice::VoiceController,
+    due: Vec<(&str, Option<String>, Option<String>)>,
+) {
+    if !due.is_empty() {
+        runtime.signal_schedule();
+    }
+    for (kind, label, text) in due {
+        let title = label
+            .map(|label| format!("{kind} «{label}»"))
+            .unwrap_or_else(|| kind.to_owned());
+        let message = text.unwrap_or_else(|| format!("Время. Сработал {title}."));
+        if let Err(error) = voice.announce_schedule(&message).await {
+            voice
+                .log(format!(
+                    "сработал {title}; озвучивание недоступно: {error}; локальный сигнал поставлен в очередь"
+                ))
+                .await;
+        } else {
+            voice
+                .log(format!(
+                    "сработал {title}; сообщение передано в голосовой звонок"
+                ))
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn due_timer_and_alarm_signal_without_a_voice_call() {
+        let runtime = RuntimeController::for_test();
+        let voice = crate::voice::VoiceController::for_test();
+        assert!(!runtime.alarm_pending());
+        announce_due(
+            &runtime,
+            &voice,
+            vec![("таймер", None, None), ("будильник", None, None)],
+        )
+        .await;
+        assert!(runtime.alarm_pending());
+        assert_eq!(voice.status().await.state, "idle");
+        assert_eq!(voice.logs().await.len(), 2);
     }
 }
 

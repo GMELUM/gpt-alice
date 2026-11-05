@@ -1,8 +1,4 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::oauth::OAuthController;
+use crate::{oauth::OAuthController, storage::Storage};
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODEL: &str = "gpt-6-luna";
@@ -30,7 +26,7 @@ pub struct UserProfile {
 pub struct UserContextController(Arc<Inner>);
 
 struct Inner {
-    path: PathBuf,
+    storage: Storage,
     profile: Mutex<UserProfile>,
 }
 
@@ -46,19 +42,21 @@ struct ApiError {
 }
 
 impl UserContextController {
-    pub fn new_near_executable() -> Self {
-        let mut path = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
-        path.push("conversation_context.json");
-        let profile = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<UserProfile>(&bytes).ok())
-            .unwrap_or_default();
-        Self(Arc::new(Inner {
-            path,
+    pub fn new(storage: Storage, directory: &std::path::Path) -> Result<Self, String> {
+        storage
+            .import_json::<UserProfile>("context", &directory.join("conversation_context.json"))?;
+        let profile = storage.get("context")?.unwrap_or_default();
+        Ok(Self(Arc::new(Inner {
+            storage,
             profile: Mutex::new(profile),
+        })))
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self(Arc::new(Inner {
+            storage: Storage::memory(),
+            profile: Mutex::new(UserProfile::default()),
         }))
     }
 
@@ -72,10 +70,13 @@ impl UserContextController {
         if revision != profile.revision {
             return Err("Профиль успел измениться. Обнови страницу и повтори сохранение.".into());
         }
-        profile.text = text.trim().to_owned();
-        profile.revision = profile.revision.saturating_add(1);
-        profile.updated_at_unix = Some(unix_now());
-        self.persist(&profile)?;
+        let next = UserProfile {
+            text: text.trim().to_owned(),
+            revision: profile.revision.saturating_add(1),
+            updated_at_unix: Some(unix_now()),
+        };
+        self.persist(&next)?;
+        *profile = next;
         Ok(profile.clone())
     }
 
@@ -183,29 +184,18 @@ impl UserContextController {
                 "Профиль вручную изменён во время обновления; результат модели пропущен".into(),
             );
         }
-        profile.text = candidate;
-        profile.revision = profile.revision.saturating_add(1);
-        profile.updated_at_unix = Some(unix_now());
-        self.persist(&profile)?;
+        let next = UserProfile {
+            text: candidate,
+            revision: profile.revision.saturating_add(1),
+            updated_at_unix: Some(unix_now()),
+        };
+        self.persist(&next)?;
+        *profile = next;
         Ok(true)
     }
 
     fn persist(&self, profile: &UserProfile) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(profile)
-            .map_err(|error| format!("Не удалось сериализовать профиль: {error}"))?;
-        let temporary = self.0.path.with_extension("json.tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|error| format!("Не удалось создать файл контекста: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("Не удалось записать контекст: {error}"))?;
-        fs::rename(&temporary, &self.0.path)
-            .map_err(|error| format!("Не удалось сохранить контекст: {error}"))
+        self.0.storage.set("context", profile)
     }
 }
 

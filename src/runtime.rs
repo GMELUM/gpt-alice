@@ -1,3 +1,4 @@
+use crate::storage::Storage;
 use std::{
     collections::VecDeque,
     env,
@@ -26,7 +27,6 @@ const EVIOCGSW_16: libc::Ioctl = 0x8002_451b_u32 as libc::Ioctl;
 const EVIOCGSW_16: libc::c_ulong = 0x8002_451b_u32 as libc::c_ulong;
 const EV_SW: u16 = 5;
 const SW_MUTE_DEVICE: u16 = 14;
-const DEFAULT_CONFIG: &str = "/data/opt/gpt-alice/config.json";
 const DEFAULT_NTP_SERVERS: [&str; 2] = ["time.cloudflare.com", "time.apple.com"];
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +110,20 @@ pub struct TimeSettings {
     pub output_volume_percent: u8,
 }
 
+#[derive(Deserialize)]
+pub struct TimeSettingsUpdate {
+    pub utc_offset_minutes: i16,
+    pub ntp_servers: Vec<String>,
+}
+
+impl TimeSettingsUpdate {
+    fn apply_to(self, mut settings: TimeSettings) -> TimeSettings {
+        settings.utc_offset_minutes = self.utc_offset_minutes;
+        settings.ntp_servers = self.ntp_servers;
+        settings
+    }
+}
+
 impl Default for TimeSettings {
     fn default() -> Self {
         Self {
@@ -151,6 +165,7 @@ struct State {
     volume: u8,
     output_muted: bool,
     bluetooth_enabled: Option<bool>,
+    bluetooth_connected: bool,
     bluetooth_volume: u8,
     bluetooth_ducked: bool,
     bluetooth_duck_gain: f32,
@@ -163,16 +178,55 @@ pub struct RuntimeController {
     audio_mixer: Arc<AudioMixer>,
     state: Arc<Mutex<State>>,
     events: broadcast::Sender<DeviceEvent>,
-    config_path: PathBuf,
+    storage: Storage,
+    bluetooth_commands: Mutex<()>,
 }
 
 impl RuntimeController {
-    pub fn new(indicators: Arc<IndicatorController>, audio_mixer: Arc<AudioMixer>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (events, _) = broadcast::channel(1);
+        Self {
+            indicators: Arc::new(IndicatorController::for_test()),
+            audio_mixer: Arc::new(AudioMixer::for_test()),
+            events,
+            storage: Storage::memory(),
+            bluetooth_commands: Mutex::new(()),
+            state: Arc::new(Mutex::new(State {
+                last_event: None,
+                recent_events: VecDeque::new(),
+                event_count: 0,
+                display: DisplayScene {
+                    name: "clock".into(),
+                    until: None,
+                },
+                time_settings: TimeSettings::default(),
+                microphone_muted: None,
+                volume: 50,
+                output_muted: false,
+                bluetooth_enabled: Some(true),
+                bluetooth_connected: true,
+                bluetooth_volume: 50,
+                bluetooth_ducked: false,
+                bluetooth_duck_gain: 1.0,
+                timer_remaining_seconds: None,
+                button_callbacks: Vec::new(),
+            })),
+        }
+    }
+    pub fn new(
+        indicators: Arc<IndicatorController>,
+        audio_mixer: Arc<AudioMixer>,
+        storage: Storage,
+        directory: &std::path::Path,
+    ) -> Result<Self, String> {
         let (events, _) = broadcast::channel(64);
         let config_path = env::var_os("GPT_ALICE_CONFIG_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
-        let time_settings = load_time_settings(&config_path);
+            .unwrap_or_else(|| directory.join("config.json"));
+        storage.import_json::<TimeSettings>("runtime", &config_path)?;
+        let time_settings = storage.get::<TimeSettings>("runtime")?.unwrap_or_default();
+        validate_time_settings(&time_settings)?;
         let initial_volume = time_settings.output_volume_percent;
         audio_mixer.set_output_volume(initial_volume);
         // The shared mixer owns software volume. Keep the hardware mixer at unity
@@ -197,6 +251,7 @@ impl RuntimeController {
             volume: initial_volume,
             output_muted: false,
             bluetooth_enabled: read_bluetooth_power(),
+            bluetooth_connected: false,
             bluetooth_volume: read_bluetooth_volume().unwrap_or(88),
             bluetooth_ducked: false,
             bluetooth_duck_gain: 1.0,
@@ -204,13 +259,14 @@ impl RuntimeController {
             button_callbacks: Vec::new(),
         }));
         Self::bluetooth_duck_loop(Arc::clone(&state));
-        Self {
+        Ok(Self {
             indicators,
             audio_mixer,
             state,
             events,
-            config_path,
-        }
+            storage,
+            bluetooth_commands: Mutex::new(()),
+        })
     }
 
     pub fn indicators(&self) -> &IndicatorController {
@@ -223,6 +279,16 @@ impl RuntimeController {
             ok: true,
             message: "Тестовый тон поставлен в общий аудиомикшер".into(),
         })
+    }
+
+    pub fn signal_schedule(&self) {
+        self.indicators.show_alarm(Duration::from_secs(3));
+        self.audio_mixer.queue_alarm();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alarm_pending(&self) -> bool {
+        self.audio_mixer.alarm_pending()
     }
 
     pub fn set_timer_display(&self, remaining_seconds: Option<u64>) {
@@ -254,14 +320,14 @@ impl RuntimeController {
         let state = Arc::clone(&self.state);
         let events = self.events.clone();
         let indicators = Arc::clone(&self.indicators);
-        let config_path = self.config_path.clone();
+        let storage = self.storage.clone();
         let settings = self
             .state
             .lock()
             .expect("runtime state lock poisoned")
             .time_settings
             .clone();
-        let _ = save_time_settings(&config_path, &settings);
+        let _ = save_time_settings(&storage, &settings);
         Self::bluetooth_audio_bridge_loop(
             Arc::clone(&self.state),
             Arc::clone(&self.audio_mixer),
@@ -366,7 +432,9 @@ impl RuntimeController {
                     .saturating_duration_since(Instant::now())
                     .as_millis()
         });
-        let connected_device = read_bluetooth_connected();
+        let connected_device = state
+            .bluetooth_connected
+            .then(|| "Bluetooth-устройство".to_owned());
         RuntimeStatus {
             input_devices: vec![
                 InputDeviceStatus {
@@ -435,8 +503,12 @@ impl RuntimeController {
         }
     }
 
-    pub fn update_time_settings(&self, settings: TimeSettings) -> Result<ActionResult, String> {
-        validate_time_settings(&settings)?;
+    pub fn update_time_settings(&self, update: TimeSettingsUpdate) -> Result<ActionResult, String> {
+        validate_time_settings(&TimeSettings {
+            utc_offset_minutes: update.utc_offset_minutes,
+            ntp_servers: update.ntp_servers.clone(),
+            ..TimeSettings::default()
+        })?;
         let old_servers = self
             .state
             .lock()
@@ -444,14 +516,16 @@ impl RuntimeController {
             .time_settings
             .ntp_servers
             .clone();
-        apply_ntp_sources(&settings.ntp_servers, &old_servers)?;
-        save_time_settings(&self.config_path, &settings)?;
-        let offset = settings.utc_offset_minutes;
+        apply_ntp_sources(&update.ntp_servers, &old_servers)?;
+        let offset = update.utc_offset_minutes;
         {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "Не удалось сохранить настройки времени".to_owned())?;
+            // Merge after NTP work so concurrent volume/brightness changes survive.
+            let settings = update.apply_to(state.time_settings.clone());
+            save_time_settings(&self.storage, &settings)?;
             state.time_settings = settings;
             if state.display.until.is_none() {
                 self.indicators.render_idle_clock(offset)?;
@@ -545,7 +619,7 @@ impl RuntimeController {
             )
         };
         if changed {
-            if let Err(error) = save_time_settings(&self.config_path, &settings) {
+            if let Err(error) = save_time_settings(&self.storage, &settings) {
                 eprintln!("could not save output volume: {error}");
             }
         }
@@ -578,7 +652,7 @@ impl RuntimeController {
             };
             (state.output_muted, state.time_settings.clone())
         };
-        save_time_settings(&self.config_path, &settings)?;
+        save_time_settings(&self.storage, &settings)?;
         self.indicators
             .render_volume(if muted { 0 } else { volume })?;
         Ok(ActionResult {
@@ -645,7 +719,7 @@ impl RuntimeController {
                 .map_err(|_| "Не удалось получить настройки экрана".to_owned())?;
             let mut settings = state.time_settings.clone();
             settings.clock_brightness_percent = percent;
-            save_time_settings(&self.config_path, &settings)?;
+            save_time_settings(&self.storage, &settings)?;
             state.time_settings = settings.clone();
             state.display = DisplayScene {
                 name: "clock".into(),
@@ -729,14 +803,36 @@ impl RuntimeController {
     }
 
     pub fn bluetooth_playback(&self, action: &str) -> Result<ActionResult, String> {
+        let _command = self
+            .bluetooth_commands
+            .lock()
+            .map_err(|_| "Управление Bluetooth недоступно")?;
+        let action = if action == "toggle" {
+            let output = crate::command::output(
+                Command::new("/usr/bin/bluetoothctl").args(["--timeout", "3", "player.show"]),
+                Duration::from_secs(4),
+            )
+            .map_err(|_| "Не удалось прочитать состояние Bluetooth-плеера")?;
+            if !output.status.success() {
+                return Err("Bluetooth-плеер недоступен".into());
+            }
+            playback_toggle_action(&String::from_utf8_lossy(&output.stdout))?
+        } else {
+            action
+        };
         let action = match action {
             "play" | "pause" | "next" | "previous" => action,
             _ => return Err("Неизвестная команда воспроизведения Bluetooth".into()),
         };
-        let output = Command::new("/usr/bin/bluetoothctl")
-            .args(["--timeout", "3", "player", action])
-            .output()
-            .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
+        let output = crate::command::output(
+            Command::new("/usr/bin/bluetoothctl").args([
+                "--timeout",
+                "3",
+                &format!("player.{action}"),
+            ]),
+            Duration::from_secs(4),
+        )
+        .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
         let text = format!(
             "{} {}",
             String::from_utf8_lossy(&output.stdout),
@@ -746,6 +842,8 @@ impl RuntimeController {
             || text.to_ascii_lowercase().contains("not available")
             || text.to_ascii_lowercase().contains("not connected")
             || text.to_ascii_lowercase().contains("no player")
+            || text.to_ascii_lowercase().contains("no default player")
+            || text.to_ascii_lowercase().contains("invalid command")
             || text.to_ascii_lowercase().contains("failed")
         {
             return Err(if text.trim().is_empty() {
@@ -764,6 +862,12 @@ impl RuntimeController {
             ok: true,
             message: message.into(),
         })
+    }
+
+    pub fn bluetooth_connected(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.bluetooth_enabled == Some(true) && state.bluetooth_connected)
     }
 
     pub fn set_agent_speaking(&self, speaking: bool) {
@@ -810,11 +914,10 @@ impl RuntimeController {
             .name("bluetooth-audio-bridge".into())
             .spawn(move || {
                 // Bluetooth is captured from BlueALSA and handed to the shared mixer.
-                let _ = Command::new("/etc/init.d/S53bluealsa-aplay")
-                    .arg("stop")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                let _ = crate::command::output(
+                    Command::new("/etc/init.d/S53bluealsa-aplay").arg("stop"),
+                    Duration::from_secs(10),
+                );
 
                 let mut bridge: Option<BluetoothAudioBridge> = None;
                 loop {
@@ -823,6 +926,9 @@ impl RuntimeController {
                         .map(|state| state.bluetooth_enabled == Some(true))
                         .unwrap_or(false);
                     let source = enabled.then(read_bluetooth_capture_source).flatten();
+                    if let Ok(mut state) = state.lock() {
+                        state.bluetooth_connected = source.is_some();
+                    }
 
                     if bridge
                         .as_ref()
@@ -977,21 +1083,35 @@ fn set_parent_death_signal(command: &mut Command) {
 fn set_parent_death_signal(_command: &mut Command) {}
 
 fn set_system_volume(volume: u8) -> Result<(), String> {
-    let output = Command::new("/usr/bin/amixer")
-        .args(["-c", "0", "set", "Master", &format!("{volume}%")])
-        .output()
-        .map_err(|error| format!("не удалось запустить amixer: {error}"))?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/amixer").args(["-c", "0", "set", "Master", &format!("{volume}%")]),
+        Duration::from_secs(3),
+    )
+    .map_err(|error| format!("не удалось запустить amixer: {error}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
     Ok(())
 }
 
+fn playback_toggle_action(output: &str) -> Result<&'static str, String> {
+    let status = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Status:"))
+        .map(str::trim);
+    match status {
+        Some("playing" | "forward-seek" | "reverse-seek") => Ok("pause"),
+        Some("paused" | "stopped") => Ok("play"),
+        _ => Err("Не удалось определить play/pause: Bluetooth-плеер не сообщил состояние".into()),
+    }
+}
+
 fn read_bluetooth_power() -> Option<bool> {
-    let output = Command::new("/usr/bin/bluetoothctl")
-        .arg("show")
-        .output()
-        .ok()?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/bluetoothctl").arg("show"),
+        Duration::from_secs(3),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1002,10 +1122,11 @@ fn read_bluetooth_power() -> Option<bool> {
 }
 
 fn run_bluetoothctl(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("/usr/bin/bluetoothctl")
-        .args(args)
-        .output()
-        .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/bluetoothctl").args(args),
+        Duration::from_secs(3),
+    )
+    .map_err(|error| format!("Не удалось запустить bluetoothctl: {error}"))?;
     let detail = format!(
         "{} {}",
         String::from_utf8_lossy(&output.stdout),
@@ -1034,35 +1155,12 @@ fn run_bluetoothctl(args: &[&str]) -> Result<(), String> {
     })
 }
 
-fn read_bluetooth_connected() -> Option<String> {
-    let output = Command::new("/usr/bin/bluealsa-aplay")
-        .arg("--list-devices")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut device_list = false;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if line.contains("List of PLAYBACK Bluetooth Devices")
-            || line.contains("List of CAPTURE Bluetooth Devices")
-        {
-            device_list = true;
-            continue;
-        }
-        if device_list && !line.is_empty() && !line.starts_with('*') {
-            return Some("Bluetooth-устройство".into());
-        }
-    }
-    None
-}
-
 fn read_bluetooth_capture_source() -> Option<String> {
-    let output = Command::new("/usr/bin/bluealsa-aplay")
-        .arg("--list-devices")
-        .output()
-        .ok()?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/bluealsa-aplay").arg("--list-devices"),
+        Duration::from_secs(3),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1090,10 +1188,11 @@ fn read_bluetooth_capture_source() -> Option<String> {
 }
 
 fn read_bluetooth_volume() -> Option<u8> {
-    let output = Command::new("/usr/bin/amixer")
-        .args(["-c", "0", "get", "Bluetooth Master"])
-        .output()
-        .ok()?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/amixer").args(["-c", "0", "get", "Bluetooth Master"]),
+        Duration::from_secs(3),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1132,27 +1231,8 @@ fn face_brightness(face: &str) -> Result<Vec<(&'static str, u8)>, String> {
     Ok(segments)
 }
 
-fn load_time_settings(path: &PathBuf) -> TimeSettings {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<TimeSettings>(&bytes).ok())
-        .filter(|settings| validate_time_settings(settings).is_ok())
-        .unwrap_or_default()
-}
-
-fn save_time_settings(path: &PathBuf, settings: &TimeSettings) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "У файла настроек времени нет родительского каталога".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Не удалось создать каталог настроек времени: {error}"))?;
-    let temporary = path.with_extension("json.tmp");
-    let contents = serde_json::to_vec_pretty(settings)
-        .map_err(|error| format!("Не удалось сериализовать настройки времени: {error}"))?;
-    fs::write(&temporary, contents)
-        .map_err(|error| format!("Не удалось записать настройки времени: {error}"))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("Не удалось заменить файл настроек времени: {error}"))
+fn save_time_settings(storage: &Storage, settings: &TimeSettings) -> Result<(), String> {
+    storage.set("runtime", settings)
 }
 
 fn validate_time_settings(settings: &TimeSettings) -> Result<(), String> {
@@ -1206,10 +1286,11 @@ fn format_utc_offset(offset_minutes: i16) -> String {
 }
 
 fn chronyc_output(arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new("/usr/bin/chronyc")
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("Не удалось запустить chronyc: {error}"))?;
+    let output = crate::command::output(
+        Command::new("/usr/bin/chronyc").args(arguments),
+        Duration::from_secs(3),
+    )
+    .map_err(|error| format!("Не удалось запустить chronyc: {error}"))?;
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if output.status.success() {
         Ok(text)
@@ -1490,4 +1571,51 @@ fn record_event(
         state.recent_events.push_back(event.clone());
     }
     let _ = events.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_pause_uses_remote_state_and_never_guesses() {
+        assert_eq!(
+            playback_toggle_action("Player default\n\tStatus: playing\n").unwrap(),
+            "pause"
+        );
+        assert_eq!(
+            playback_toggle_action("\tStatus: paused\n").unwrap(),
+            "play"
+        );
+        assert_eq!(
+            playback_toggle_action("\tStatus: stopped\n").unwrap(),
+            "play"
+        );
+        assert!(playback_toggle_action("No default player available").is_err());
+        assert!(playback_toggle_action("Status: error").is_err());
+    }
+
+    #[test]
+    fn time_form_preserves_volume_and_brightness() {
+        let update: TimeSettingsUpdate =
+            serde_json::from_str(r#"{"utc_offset_minutes":60,"ntp_servers":["time.apple.com"]}"#)
+                .unwrap();
+        let settings = update.apply_to(TimeSettings {
+            output_volume_percent: 23,
+            clock_brightness_percent: 17,
+            ..TimeSettings::default()
+        });
+        assert_eq!(settings.output_volume_percent, 23);
+        assert_eq!(settings.clock_brightness_percent, 17);
+        assert_eq!(settings.utc_offset_minutes, 60);
+        assert_eq!(settings.ntp_servers, ["time.apple.com"]);
+    }
+
+    #[test]
+    fn runtime_status_reads_cached_bluetooth_state_without_utilities() {
+        let runtime = RuntimeController::for_test();
+        assert!(runtime.status().bluetooth.connected);
+        runtime.state.lock().unwrap().bluetooth_connected = false;
+        assert!(!runtime.status().bluetooth.connected);
+    }
 }

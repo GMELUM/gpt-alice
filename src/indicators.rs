@@ -24,6 +24,8 @@ const CLOCK_SEGMENTS: [&str; 32] = [
 
 #[derive(Clone)]
 pub struct IndicatorController {
+    #[cfg(test)]
+    render_hardware: bool,
     initial_frame: Arc<Mutex<Option<[u8; FRAMEBUFFER_BYTES]>>>,
     display: Arc<Mutex<DisplayState>>,
     clock_brightness: Arc<Mutex<u8>>,
@@ -38,7 +40,7 @@ struct RingState {
     call_active: bool,
     bluetooth_last_audio: Option<std::time::Instant>,
     muted: bool,
-    alarm_active: bool,
+    alarm_until: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +77,8 @@ impl IndicatorController {
     pub fn new() -> Self {
         let initial_frame = read_frame().ok();
         Self {
+            #[cfg(test)]
+            render_hardware: true,
             initial_frame: Arc::new(Mutex::new(initial_frame)),
             display: Arc::new(Mutex::new(DisplayState::Clock)),
             clock_brightness: Arc::new(Mutex::new(150)),
@@ -82,6 +86,14 @@ impl IndicatorController {
             web_search_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             colon_lit: Arc::new(Mutex::new(None)),
             colon_should_lit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            render_hardware: false,
+            ..Self::new()
         }
     }
 
@@ -185,15 +197,19 @@ impl IndicatorController {
         }
     }
 
-    pub fn set_alarm_active(&self, active: bool) {
+    pub fn show_alarm(&self, duration: Duration) {
         if let Ok(mut state) = self.ring_state.lock() {
-            state.alarm_active = active;
+            state.alarm_until = Some(std::time::Instant::now() + duration);
         }
     }
 
     /// Render the current ring state. Priority: alarm, microphone mute, search,
     /// live conversation, active Bluetooth stream, then the dim idle color.
     pub fn render_ring_frame(&self, phase: usize) -> Result<(), String> {
+        #[cfg(test)]
+        if !self.render_hardware {
+            return Ok(());
+        }
         let state = self
             .ring_state
             .lock()
@@ -205,7 +221,9 @@ impl IndicatorController {
         let bluetooth_active = state
             .bluetooth_last_audio
             .is_some_and(|at| at.elapsed() < Duration::from_millis(700));
-        let alarm = state.alarm_active;
+        let alarm = state
+            .alarm_until
+            .is_some_and(|until| until > std::time::Instant::now());
         let color = if alarm {
             [0xff, 0x00, 0x00]
         } else if state.muted {
@@ -219,7 +237,7 @@ impl IndicatorController {
         } else {
             VOICE_IDLE_COLOR
         };
-        let animated = state.alarm_active || searching || state.call_active || bluetooth_active;
+        let animated = alarm || searching || state.call_active || bluetooth_active;
         let dim = if alarm && phase % 2 == 1 {
             [0x20, 0x00, 0x00]
         } else if searching {

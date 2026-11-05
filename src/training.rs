@@ -40,6 +40,7 @@ pub struct CaptureMetadata {
 }
 
 struct ActiveCapture {
+    id: Uuid,
     child: Child,
     audio: JoinHandle<std::io::Result<Vec<u8>>>,
 }
@@ -53,6 +54,18 @@ pub struct DeviceRecorder {
 impl DeviceRecorder {
     pub async fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    async fn expire(&self, id: Uuid) {
+        let mut slot = self.capture.lock().await;
+        if slot.as_ref().is_none_or(|capture| capture.id != id) {
+            return;
+        }
+        let mut capture = slot.take().expect("capture identity checked");
+        let _ = capture.child.start_kill();
+        let _ = capture.child.wait().await;
+        let _ = capture.audio.await;
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -170,6 +183,14 @@ pub async fn start_device_capture(
     Extension(recorder): Extension<DeviceRecorder>,
     Json(metadata): Json<CaptureMetadata>,
 ) -> Response {
+    // Finish reservation/cleanup even if the HTTP client disconnects.
+    match tokio::spawn(begin_device_capture(recorder, metadata)).await {
+        Ok(response) => response,
+        Err(error) => internal_error(error).into_response(),
+    }
+}
+
+async fn begin_device_capture(recorder: DeviceRecorder, metadata: CaptureMetadata) -> Response {
     if let Err((status, message)) = validate_capture_metadata(&metadata) {
         return (
             status,
@@ -227,16 +248,12 @@ pub async fn start_device_capture(
         stdout.read_to_end(&mut bytes).await?;
         Ok(bytes)
     });
-    *recorder.capture.lock().await = Some(ActiveCapture { child, audio });
+    let id = Uuid::new_v4();
+    *recorder.capture.lock().await = Some(ActiveCapture { id, child, audio });
     let expiration = recorder.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(9)).await;
-        if let Some(mut capture) = expiration.capture.lock().await.take() {
-            let _ = capture.child.start_kill();
-            let _ = capture.child.wait().await;
-            let _ = capture.audio.await;
-            expiration.active.store(false, Ordering::Release);
-        }
+        expiration.expire(id).await;
     });
 
     // Metadata stays in the UI until stop; this endpoint only reserves the microphone.
@@ -251,6 +268,13 @@ pub async fn stop_device_capture(
     Extension(recorder): Extension<DeviceRecorder>,
     Json(metadata): Json<CaptureMetadata>,
 ) -> Response {
+    match tokio::spawn(finish_device_capture(recorder, metadata)).await {
+        Ok(response) => response,
+        Err(error) => internal_error(error).into_response(),
+    }
+}
+
+async fn finish_device_capture(recorder: DeviceRecorder, metadata: CaptureMetadata) -> Response {
     if let Err((status, message)) = validate_capture_metadata(&metadata) {
         return (
             status,
@@ -260,7 +284,6 @@ pub async fn stop_device_capture(
     }
     let capture = recorder.capture.lock().await.take();
     let Some(mut capture) = capture else {
-        recorder.active.store(false, Ordering::Release);
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"ok": false, "message": "Сейчас нет активной записи"})),
@@ -479,4 +502,55 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Не удалось сохранить запись на диск".into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn install_capture(recorder: &DeviceRecorder) -> Uuid {
+        let id = Uuid::new_v4();
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let audio = tokio::spawn(async { Ok(Vec::new()) });
+        *recorder.capture.lock().await = Some(ActiveCapture { id, child, audio });
+        recorder.active.store(true, Ordering::Release);
+        id
+    }
+
+    #[tokio::test]
+    async fn previous_capture_timeout_cannot_stop_the_next_recording() {
+        let recorder = DeviceRecorder::default();
+        let first = install_capture(&recorder).await;
+        recorder.expire(first).await;
+        let second = install_capture(&recorder).await;
+        recorder.expire(first).await;
+        assert!(recorder.is_active().await);
+        {
+            let mut slot = recorder.capture.lock().await;
+            let capture = slot.as_mut().unwrap();
+            assert_eq!(capture.id, second);
+            assert!(capture.child.try_wait().unwrap().is_none());
+        }
+        recorder.expire(second).await;
+        assert!(!recorder.is_active().await);
+    }
+
+    #[tokio::test]
+    async fn stop_during_startup_does_not_release_microphone_reservation() {
+        let recorder = DeviceRecorder::default();
+        recorder.active.store(true, Ordering::Release);
+        let response = finish_device_capture(
+            recorder.clone(),
+            CaptureMetadata {
+                speaker_id: "test-speaker".into(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(recorder.is_active().await);
+    }
 }

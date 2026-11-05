@@ -41,9 +41,9 @@ impl AudioController {
         }
     }
 
-    fn request_sfx(&self) {
+    pub fn request_sfx(&self) {
         match prepare_button_wav(ZEN_HOVER_WAV, SFX_GAIN, SFX_STRETCH)
-            .and_then(|wav| self.mixer.queue_sfx(&wav))
+            .and_then(|wav| self.mixer.queue_button_sfx(&wav))
         {
             Ok(()) => eprintln!("button SFX queued in shared audio mixer"),
             Err(error) => eprintln!("button audio playback failed: {error}"),

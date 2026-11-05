@@ -25,6 +25,7 @@ struct Frame(f32, f32);
 
 enum Source {
     Sfx(Vec<Frame>),
+    ButtonSfx(Vec<Frame>),
     Bluetooth(Vec<Frame>),
 }
 
@@ -34,9 +35,26 @@ pub struct AudioMixer {
     bluetooth_gain: Arc<Mutex<f32>>,
     output_volume: Arc<AtomicU8>,
     clear_agent_voice: Arc<std::sync::atomic::AtomicBool>,
+    alarm_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AudioMixer {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (sender, _) = mpsc::sync_channel(1);
+        Self {
+            sender,
+            bluetooth_gain: Arc::new(Mutex::new(1.0)),
+            output_volume: Arc::new(AtomicU8::new(100)),
+            clear_agent_voice: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            alarm_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alarm_pending(&self) -> bool {
+        self.alarm_requested.load(Ordering::Acquire)
+    }
     pub fn start() -> Result<Self, String> {
         let socket = std::net::UdpSocket::bind(SOCKET)
             .map_err(|error| format!("не удалось открыть аудиовход {SOCKET}: {error}"))?;
@@ -50,6 +68,8 @@ impl AudioMixer {
         let worker_output_volume = Arc::clone(&output_volume);
         let clear_agent_voice = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_clear_agent_voice = Arc::clone(&clear_agent_voice);
+        let alarm_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_alarm_requested = Arc::clone(&alarm_requested);
         thread::Builder::new()
             .name("shared-audio-output".into())
             .spawn(move || {
@@ -59,6 +79,7 @@ impl AudioMixer {
                     worker_gain,
                     worker_output_volume,
                     worker_clear_agent_voice,
+                    worker_alarm_requested,
                 )
             })
             .map_err(|error| format!("не удалось запустить общий аудиовыход: {error}"))?;
@@ -67,10 +88,11 @@ impl AudioMixer {
             bluetooth_gain,
             output_volume,
             clear_agent_voice,
+            alarm_requested,
         })
     }
 
-    /// Sets the software master gain applied equally to voice, Bluetooth, and SFX.
+    /// Master gain for media, voice, alarms and test tones; button feedback is fixed.
     pub fn set_output_volume(&self, volume: u8) {
         self.output_volume.store(volume.min(100), Ordering::Release);
     }
@@ -89,7 +111,12 @@ impl AudioMixer {
             .map_err(|error| format!("не удалось поставить тестовый тон в аудиомикшер: {error}"))
     }
 
-    pub fn queue_sfx(&self, wav: &[u8]) -> Result<(), String> {
+    pub fn queue_alarm(&self) {
+        // Alarm delivery must not depend on free space in the Bluetooth/SFX queue.
+        self.alarm_requested.store(true, Ordering::Release);
+    }
+
+    pub fn queue_button_sfx(&self, wav: &[u8]) -> Result<(), String> {
         let samples = wav_to_stereo_48k(wav)?;
         eprintln!(
             "shared audio SFX queued: frames={}, peak={:.3}",
@@ -99,7 +126,7 @@ impl AudioMixer {
                 .max(frame.1.abs()))
         );
         self.sender
-            .try_send(Source::Sfx(samples))
+            .try_send(Source::ButtonSfx(samples))
             .map_err(|error| format!("не удалось поставить SFX в аудиомикшер: {error}"))
     }
 
@@ -136,6 +163,7 @@ fn run_mixer(
     gain: Arc<Mutex<f32>>,
     output_volume: Arc<AtomicU8>,
     clear_agent_voice: Arc<std::sync::atomic::AtomicBool>,
+    alarm_requested: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut output = match Output::start() {
         Ok(output) => Some(output),
@@ -147,6 +175,10 @@ fn run_mixer(
     let mut voice = VecDeque::<Frame>::new();
     let mut bluetooth = VecDeque::<Frame>::new();
     let mut sfx = VecDeque::<Frame>::new();
+    let mut buttons = VecDeque::<Frame>::new();
+    let mut alarm = VecDeque::<Frame>::new();
+    let diagnostics =
+        std::env::var_os("GPT_ALICE_AUDIO_DIAGNOSTICS").is_some_and(|value| value == "1");
     let mut datagram = [0u8; 4096];
     let mut next = Instant::now();
     let mut retry_output_at = Instant::now();
@@ -160,8 +192,15 @@ fn run_mixer(
                     sfx.clear();
                     sfx.extend(frames);
                 }
+                Source::ButtonSfx(frames) => {
+                    buttons.clear();
+                    buttons.extend(frames);
+                }
                 Source::Bluetooth(frames) => append_bounded(&mut bluetooth, frames),
             }
+        }
+        if alarm_requested.swap(false, Ordering::AcqRel) {
+            alarm = alarm_frames().into();
         }
         loop {
             match socket.recv(&mut datagram) {
@@ -173,7 +212,7 @@ fn run_mixer(
                         Frame(sample, sample)
                     });
                     append_bounded(&mut voice, values.collect());
-                    if voice_packets.is_multiple_of(100) {
+                    if diagnostics && voice_packets.is_multiple_of(100) {
                         eprintln!(
                             "shared audio input: {voice_packets} voice packets received, peak={last_voice_peak:.4}, queued_frames={}",
                             voice.len()
@@ -220,8 +259,13 @@ fn run_mixer(
                 left += frame.0;
                 right += frame.1;
             }
-            for value in [left, right] {
-                let sample = (value * master_gain).clamp(-1.0, 1.0);
+            if let Some(frame) = alarm.pop_front() {
+                left += frame.0;
+                right += frame.1;
+            }
+            let button = buttons.pop_front().unwrap_or(Frame(0.0, 0.0));
+            for (value, feedback) in [(left, button.0), (right, button.1)] {
+                let sample = mix_button_feedback(value, master_gain, feedback);
                 let sample = (sample * i16::MAX as f32).round() as i16;
                 pcm.extend_from_slice(&sample.to_le_bytes());
             }
@@ -242,7 +286,7 @@ fn run_mixer(
                 retry_output_at = Instant::now() + Duration::from_secs(1);
             } else {
                 output_blocks += 1;
-                if output_blocks.is_multiple_of(500) {
+                if diagnostics && output_blocks.is_multiple_of(500) {
                     let peak = pcm
                         .chunks_exact(2)
                         .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs())
@@ -255,6 +299,52 @@ fn run_mixer(
                 }
                 output = Some(active);
             }
+        }
+    }
+}
+
+fn alarm_frames() -> Vec<Frame> {
+    (0..RATE * 3)
+        .map(|index| {
+            let t = (index % RATE) as f32 / RATE as f32;
+            let fade = (t / 0.02).min(1.0) * ((0.6 - t) / 0.02).clamp(0.0, 1.0);
+            let sample = (std::f32::consts::TAU * 880.0 * t).sin() * 0.35 * fade;
+            Frame(sample, sample)
+        })
+        .collect()
+}
+
+fn mix_button_feedback(media: f32, master_gain: f32, button: f32) -> f32 {
+    (media * master_gain + button * 0.10).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_feedback_is_ten_percent_at_every_master_volume() {
+        for volume in [0.0, 0.1, 0.5, 1.0] {
+            assert_eq!(mix_button_feedback(0.0, volume, 1.0), 0.1);
+            assert_eq!(mix_button_feedback(0.0, volume, -1.0), -0.1);
+            assert!(
+                (mix_button_feedback(0.4, volume, 0.5) - (0.4 * volume + 0.05)).abs() < 0.00001
+            );
+        }
+    }
+
+    #[test]
+    fn alarm_survives_sfx_queue_failure_and_voice_interruption() {
+        let mixer = AudioMixer::for_test();
+        mixer.queue_alarm();
+        assert!(mixer.queue_test_tone().is_err());
+        mixer.clear_agent_voice();
+        assert!(mixer.alarm_requested.load(Ordering::Acquire));
+        let frames = alarm_frames();
+        assert_eq!(frames.len(), RATE * 3);
+        for pulse in frames.chunks_exact(RATE) {
+            assert!(pulse.iter().any(|frame| frame.0.abs() > 0.3));
+            assert!(pulse[RATE * 3 / 4..].iter().all(|frame| frame.0 == 0.0));
         }
     }
 }

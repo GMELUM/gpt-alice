@@ -229,7 +229,7 @@
 
         <section class="runtime-card" aria-label="Голосовой звонок GPT-Live">
           <h3>Голосовой звонок</h3>
-          <p>Центральная кнопка запускает или завершает звонок. Пока подключение активно, микрофон передаёт звук GPT-Live, а ответ воспроизводится через динамик. Обнаружение начала и конца речи добавим отдельно.</p>
+          <p>Без Bluetooth центральная кнопка запускает или завершает звонок. При подключённом Bluetooth она переключает play/pause; звонком можно управлять кнопкой ниже. Во время звонка микрофон передаёт звук GPT-Live, а ответ воспроизводится через динамик.</p>
           <div class="runtime-row"><span class="runtime-pill" id="voice-state">Звонок не запущен</span></div>
           <div class="button-row"><button class="action-button" id="voice-toggle" type="button">Начать звонок</button></div>
           <div class="silence-monitor" aria-live="polite">
@@ -258,7 +258,7 @@
 
         <section class="runtime-card" aria-label="Bluetooth-колонка">
           <h3>Bluetooth-колонка</h3>
-          <p>Включи режим сопряжения и выбери Mini 3 в Bluetooth-настройках телефона. Музыка будет играть через динамики колонки; когда GPT говорит, музыка плавно становится тише.</p>
+          <p>Включи режим сопряжения и выбери Mini 3 в Bluetooth-настройках телефона. Центр — play/pause; быстрый свайп − → центр → + — следующий трек, обратно — предыдущий. Звук кнопок всегда на 10%, а шаг громкости — 5 пунктов. Во время речи GPT музыка плавно становится тише.</p>
           <div class="runtime-row"><span class="runtime-pill" id="bluetooth-state">Проверка Bluetooth…</span></div>
           <label class="trigger-toggle" for="bluetooth-speaker-toggle">
             <span class="trigger-toggle-copy">Принимать Bluetooth-аудио<small>Выключение отключит Bluetooth и сопряжённые устройства.</small></span>
@@ -268,6 +268,27 @@
           <div class="control-row"><label for="bluetooth-volume">Громкость музыки</label><input id="bluetooth-volume" type="range" min="0" max="100" value="88" /><output id="bluetooth-volume-value">88%</output></div>
           <div class="button-row"><button class="action-button secondary" data-bt-action="play" type="button">Продолжить</button><button class="action-button secondary" data-bt-action="pause" type="button">Пауза</button><button class="action-button secondary" data-bt-action="previous" type="button">Назад</button><button class="action-button secondary" data-bt-action="next" type="button">Вперёд</button></div>
           <div class="indicator-status" id="bluetooth-status" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="runtime-card" aria-label="Telegram">
+          <h3>Telegram</h3>
+          <p>Попроси GPT Alice отправить текст, ссылку или картинку в выбранный чат. Для личных сообщений сначала открой своего бота в Telegram и нажми Start.</p>
+          <label class="trigger-toggle" for="telegram-enabled">
+            <span class="trigger-toggle-copy">Разрешить отправку в Telegram<small>Изменения вступят в силу после сохранения.</small></span>
+            <input id="telegram-enabled" type="checkbox" role="switch" disabled />
+            <span class="trigger-switch" aria-hidden="true"></span>
+          </label>
+          <div class="time-form">
+            <label class="time-field" for="telegram-token">Токен бота от BotFather<input id="telegram-token" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Токен не задан" disabled /></label>
+            <label class="time-field" for="telegram-chat">ID чата<input id="telegram-chat" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="Числовой ID или @имя_канала" disabled /></label>
+          </div>
+          <div class="button-row">
+            <button class="action-button" id="telegram-save" type="button" disabled>Сохранить</button>
+            <button class="action-button secondary" id="telegram-test" type="button" disabled>Отправить проверочное сообщение</button>
+            <button class="action-button secondary" id="telegram-clear" type="button" disabled>Удалить токен и чат</button>
+          </div>
+          <div class="indicator-status" id="telegram-status" role="status" aria-live="polite"></div>
+          <p class="small">Сохранённый токен не отображается: оставь поле пустым, чтобы сохранить его. Секреты зашифрованы в базе колонки. Настраивай интеграцию в доверенной домашней сети. Кнопка проверки отправляет сообщение в сохранённый чат.</p>
         </section>
 
         <section class="runtime-card" aria-label="VPN AmneziaWG">
@@ -367,6 +388,59 @@
         if (!response.ok || !result.ok) throw new Error(result.message || `Ошибка HTTP ${response.status}`);
         return result.message;
       }
+
+      const telegramEnabled = document.querySelector("#telegram-enabled");
+      const telegramToken = document.querySelector("#telegram-token");
+      const telegramChat = document.querySelector("#telegram-chat");
+      const telegramStatus = document.querySelector("#telegram-status");
+      const telegramSave = document.querySelector("#telegram-save");
+      const telegramTest = document.querySelector("#telegram-test");
+      const telegramClear = document.querySelector("#telegram-clear");
+      const telegramControls = [telegramEnabled, telegramToken, telegramChat, telegramSave, telegramTest, telegramClear];
+      let telegramSaved = null;
+      let telegramDirty = false;
+      function telegramReady() {
+        telegramControls.forEach(control => { control.disabled = false; });
+        telegramTest.disabled = telegramDirty || !telegramSaved?.enabled || !telegramSaved?.configured;
+        telegramClear.disabled = !telegramSaved?.token_set && !telegramSaved?.chat_id;
+      }
+      async function refreshTelegram() {
+        const response = await fetch("/api/telegram", { cache: "no-store" });
+        if (!response.ok) throw new Error("Не удалось загрузить настройки Telegram");
+        telegramSaved = await response.json();
+        telegramEnabled.checked = telegramSaved.enabled;
+        telegramChat.value = telegramSaved.chat_id;
+        telegramToken.value = "";
+        telegramToken.placeholder = telegramSaved.token_set ? "Токен сохранён; оставь пустым" : "Токен не задан";
+        telegramDirty = false;
+        telegramReady();
+      }
+      [telegramEnabled, telegramToken, telegramChat].forEach(control => control.addEventListener("input", () => {
+        telegramDirty = true;
+        telegramTest.disabled = true;
+        setStatus(telegramStatus, "Есть несохранённые изменения.");
+      }));
+      async function telegramAction(action) {
+        telegramControls.forEach(control => { control.disabled = true; });
+        try { setStatus(telegramStatus, await action()); }
+        catch (error) { setStatus(telegramStatus, error.message, true); }
+        finally { if (telegramSaved) telegramReady(); }
+      }
+      telegramSave.addEventListener("click", () => telegramAction(async () => {
+        const message = await postJson("/api/telegram", { enabled: telegramEnabled.checked, token: telegramToken.value || null, chat_id: telegramChat.value });
+        telegramToken.value = "";
+        await refreshTelegram();
+        return message;
+      }));
+      telegramTest.addEventListener("click", () => telegramAction(() => postJson("/api/telegram/test", {})));
+      telegramClear.addEventListener("click", () => telegramAction(async () => {
+        const response = await fetch("/api/telegram", { method: "DELETE" });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || "Не удалось удалить настройки");
+        await refreshTelegram();
+        return result.message;
+      }));
+      refreshTelegram().catch(error => setStatus(telegramStatus, error.message, true));
 
       async function refreshAuth() {
         const state = document.querySelector("#auth-state");

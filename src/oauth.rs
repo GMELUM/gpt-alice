@@ -1,12 +1,9 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::storage::Storage;
 use axum::{Json, extract::Extension, http::StatusCode, response::IntoResponse};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -22,9 +19,11 @@ const REFRESH_SKEW: Duration = Duration::from_secs(300);
 pub struct OAuthController(Arc<Inner>);
 
 struct Inner {
-    path: PathBuf,
+    storage: Storage,
     client: reqwest::Client,
     state: Mutex<State>,
+    credentials: Mutex<()>,
+    issuer: String,
 }
 
 #[derive(Default)]
@@ -34,6 +33,7 @@ struct State {
 }
 
 struct Pending {
+    id: uuid::Uuid,
     user_code: String,
     expires_at: u64,
 }
@@ -106,50 +106,44 @@ struct TokenRequest<'a> {
 }
 
 impl OAuthController {
-    pub fn new_near_executable() -> Result<Self, String> {
-        let executable = std::env::current_exe()
-            .map_err(|e| format!("Не удалось определить путь к программе: {e}"))?;
-        let parent = executable.parent().ok_or("У программы нет каталога")?;
+    pub fn new(storage: Storage, directory: &std::path::Path) -> Result<Self, String> {
+        storage.import_json::<Tokens>("oauth", &directory.join("auth.json"))?;
         Ok(Self(Arc::new(Inner {
-            path: parent.join("auth.json"),
+            storage,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
                 .map_err(|e| format!("Не удалось создать HTTP-клиент: {e}"))?,
             state: Mutex::new(State::default()),
+            credentials: Mutex::new(()),
+            issuer: ISSUER.into(),
         })))
     }
 
     pub async fn refresh_loop(&self) {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            if let Err(error) = self.refresh_if_needed().await {
-                self.0.state.lock().await.last_error = Some(error);
-            }
+            let _ = self.refresh_if_needed().await;
         }
     }
 
     async fn read_tokens(&self) -> Result<Option<Tokens>, String> {
-        let path = self.0.path.clone();
-        tokio::task::spawn_blocking(move || match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| format!("Не удалось прочитать auth.json: {e}")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("Не удалось прочитать auth.json: {error}")),
-        })
-        .await
-        .map_err(|e| format!("Ошибка файловой задачи: {e}"))?
+        self.0.storage.get("oauth")
     }
 
-    async fn save_tokens(&self, tokens: Tokens) -> Result<(), String> {
-        let path = self.0.path.clone();
-        tokio::task::spawn_blocking(move || save_private_json(&path, &tokens))
-            .await
-            .map_err(|e| format!("Ошибка файловой задачи: {e}"))?
+    fn save_tokens(&self, tokens: Tokens) -> Result<(), String> {
+        // Keep the write inside the credential lock, including on task cancellation.
+        self.0.storage.set("oauth", &tokens)
     }
 
     async fn refresh_if_needed(&self) -> Result<(), String> {
+        let _operation = self.0.credentials.lock().await;
+        let result = self.refresh_tokens_locked().await;
+        self.0.state.lock().await.last_error = result.as_ref().err().cloned();
+        result
+    }
+
+    async fn refresh_tokens_locked(&self) -> Result<(), String> {
         let Some(mut tokens) = self.read_tokens().await? else {
             return Ok(());
         };
@@ -163,7 +157,7 @@ impl OAuthController {
         let response = self
             .0
             .client
-            .post(format!("{ISSUER}/oauth/token"))
+            .post(format!("{}/oauth/token", self.0.issuer))
             .form(&TokenRequest {
                 grant_type: "refresh_token",
                 code: None,
@@ -201,7 +195,7 @@ impl OAuthController {
             .unwrap_or(tokens.account_id);
         tokens.expires_at =
             token_expiry(&tokens.access_token).unwrap_or_else(|| now() + fresh.expires_in);
-        self.save_tokens(tokens).await?;
+        self.save_tokens(tokens)?;
         self.0.state.lock().await.last_error = None;
         Ok(())
     }
@@ -209,7 +203,8 @@ impl OAuthController {
     /// Получить актуальный access-токен для следующих GPT-модулей приложения.
     #[allow(dead_code)]
     pub async fn access_token(&self) -> Result<String, String> {
-        self.refresh_if_needed().await?;
+        let _operation = self.0.credentials.lock().await;
+        self.refresh_tokens_locked().await?;
         self.read_tokens()
             .await?
             .filter(|tokens| !tokens.access_token.is_empty())
@@ -219,7 +214,8 @@ impl OAuthController {
 
     /// Return the refreshed OAuth credentials needed to create a GPT-Live call.
     pub async fn live_credentials(&self) -> Result<(String, String), String> {
-        self.refresh_if_needed().await?;
+        let _operation = self.0.credentials.lock().await;
+        self.refresh_tokens_locked().await?;
         let tokens = self
             .read_tokens()
             .await?
@@ -246,10 +242,14 @@ impl OAuthController {
     }
 
     async fn start(&self) -> Result<(), String> {
+        let _operation = self.0.credentials.lock().await;
         let response = self
             .0
             .client
-            .post(format!("{ISSUER}/api/accounts/deviceauth/usercode"))
+            .post(format!(
+                "{}/api/accounts/deviceauth/usercode",
+                self.0.issuer
+            ))
             .json(&serde_json::json!({"client_id": CLIENT_ID}))
             .send()
             .await
@@ -274,6 +274,7 @@ impl OAuthController {
         let state = Arc::clone(&self.0);
         let interval = interval_seconds(&started.interval).saturating_add(3).max(3);
         let pending = Pending {
+            id: uuid::Uuid::new_v4(),
             user_code: started.user_code,
             expires_at: now() + 900,
         };
@@ -290,6 +291,7 @@ impl OAuthController {
                 );
             }
             locked.pending = Some(Pending {
+                id: pending.id,
                 user_code: pending.user_code.clone(),
                 expires_at: pending.expires_at,
             });
@@ -302,14 +304,8 @@ impl OAuthController {
     }
 
     async fn logout(&self) -> Result<(), String> {
-        let path = self.0.path.clone();
-        tokio::task::spawn_blocking(move || match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("Не удалось удалить auth.json: {error}")),
-        })
-        .await
-        .map_err(|e| format!("Ошибка файловой задачи: {e}"))??;
+        let _operation = self.0.credentials.lock().await;
+        self.0.storage.delete("oauth")?;
         let mut state = self.0.state.lock().await;
         state.pending = None;
         state.last_error = None;
@@ -329,18 +325,34 @@ async fn poll_device_flow(
             if !state
                 .pending
                 .as_ref()
-                .is_some_and(|active| active.user_code == pending.user_code)
+                .is_some_and(|active| active.id == pending.id)
             {
                 return;
             }
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let response = match inner.client.post(format!("{ISSUER}/api/accounts/deviceauth/token"))
+        let response = inner.client.post(format!("{}/api/accounts/deviceauth/token", inner.issuer))
             .json(&serde_json::json!({"device_auth_id": device_auth_id, "user_code": pending.user_code}))
-            .send().await {
-                Ok(response) => response,
-                Err(error) => { inner.state.lock().await.last_error = Some(format!("Ошибка ожидания подтверждения: {error}")); continue; }
-            };
+            .send().await;
+        let _operation = inner.credentials.lock().await;
+        if !inner
+            .state
+            .lock()
+            .await
+            .pending
+            .as_ref()
+            .is_some_and(|active| active.id == pending.id)
+        {
+            return;
+        }
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                inner.state.lock().await.last_error =
+                    Some(format!("Ошибка ожидания подтверждения: {error}"));
+                continue;
+            }
+        };
         if response.status() == StatusCode::FORBIDDEN || response.status() == StatusCode::NOT_FOUND
         {
             continue;
@@ -365,7 +377,7 @@ async fn poll_device_flow(
             if !state
                 .pending
                 .as_ref()
-                .is_some_and(|active| active.user_code == pending.user_code)
+                .is_some_and(|active| active.id == pending.id)
             {
                 return;
             }
@@ -373,7 +385,7 @@ async fn poll_device_flow(
         let result = exchange_code(&inner, &grant).await;
         match result {
             Ok(tokens) => {
-                if let Err(error) = save_private_json(&inner.path, &tokens) {
+                if let Err(error) = inner.storage.set("oauth", &tokens) {
                     inner.state.lock().await.last_error = Some(error);
                 } else {
                     inner.state.lock().await.last_error = None;
@@ -384,7 +396,15 @@ async fn poll_device_flow(
         inner.state.lock().await.pending = None;
         return;
     }
+    let _operation = inner.credentials.lock().await;
     let mut state = inner.state.lock().await;
+    if !state
+        .pending
+        .as_ref()
+        .is_some_and(|active| active.id == pending.id)
+    {
+        return;
+    }
     state.pending = None;
     if state.last_error.is_none() {
         state.last_error = Some("Время ожидания кода входа истекло. Начните вход ещё раз.".into());
@@ -394,7 +414,7 @@ async fn poll_device_flow(
 async fn exchange_code(inner: &Inner, grant: &DeviceGrant) -> Result<Tokens, String> {
     let response = inner
         .client
-        .post(format!("{ISSUER}/oauth/token"))
+        .post(format!("{}/oauth/token", inner.issuer))
         .form(&TokenRequest {
             grant_type: "authorization_code",
             code: Some(&grant.authorization_code),
@@ -432,37 +452,6 @@ async fn exchange_code(inner: &Inner, grant: &DeviceGrant) -> Result<Tokens, Str
         expires_at,
     })
 }
-
-fn save_private_json(path: &Path, tokens: &Tokens) -> Result<(), String> {
-    let data = serde_json::to_vec_pretty(tokens)
-        .map_err(|e| format!("Не удалось сериализовать токены: {e}"))?;
-    let mut temporary = path.to_path_buf();
-    temporary.set_extension(format!("json.tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|e| format!("Не удалось создать закрытый файл токенов: {e}"))?;
-        file.write_all(&data)
-            .map_err(|e| format!("Не удалось записать токены: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("Не удалось сохранить токены на диск: {e}"))?;
-        fs::rename(&temporary, path).map_err(|e| format!("Не удалось заменить auth.json: {e}"))?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Не удалось закрыть права auth.json: {e}"))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 fn interval_seconds(value: &Value) -> u64 {
     value
@@ -527,5 +516,165 @@ pub async fn logout(Extension(controller): Extension<OAuthController>) -> impl I
             Json(serde_json::json!({"ok": false, "message": error})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, extract::State as HttpState, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct Mock {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        block_device_poll: bool,
+    }
+
+    async fn token(HttpState(mock): HttpState<Mock>) -> Json<Value> {
+        mock.calls.fetch_add(1, Ordering::SeqCst);
+        if !mock.block_device_poll {
+            mock.entered.notify_one();
+            mock.release.notified().await;
+        }
+        Json(
+            serde_json::json!({"access_token":"fresh-test-token","refresh_token":"rotated-test-token","expires_in":3600}),
+        )
+    }
+
+    async fn device_token(HttpState(mock): HttpState<Mock>) -> Json<Value> {
+        if mock.block_device_poll {
+            mock.entered.notify_one();
+            mock.release.notified().await;
+        }
+        Json(serde_json::json!({"authorization_code":"test-code","code_verifier":"test-verifier"}))
+    }
+
+    async fn setup(
+        block_device_poll: bool,
+    ) -> (OAuthController, Mock, tokio::task::JoinHandle<()>) {
+        let mock = Mock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            block_device_poll,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/oauth/token", post(token))
+            .route("/api/accounts/deviceauth/token", post(device_token))
+            .with_state(mock.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let controller = OAuthController(Arc::new(Inner {
+            storage: Storage::memory(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            state: Mutex::new(State::default()),
+            credentials: Mutex::new(()),
+            issuer: format!("http://{address}"),
+        }));
+        controller
+            .save_tokens(Tokens {
+                access_token: "old-test-token".into(),
+                refresh_token: "old-test-refresh".into(),
+                id_token: String::new(),
+                account_id: "test-account".into(),
+                expires_at: 0,
+            })
+            .unwrap();
+        (controller, mock, server)
+    }
+
+    fn cleanup(_controller: OAuthController, server: tokio::task::JoinHandle<()>) {
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_refresh_rotating_token_only_once() {
+        let (controller, mock, server) = setup(false).await;
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let controller = controller.clone();
+            tasks.push(tokio::spawn(
+                async move { controller.live_credentials().await },
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(3), mock.entered.notified())
+            .await
+            .unwrap();
+        mock.release.notify_one();
+        for task in tasks {
+            let (token, account) = tokio::time::timeout(Duration::from_secs(4), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(token, "fresh-test-token");
+            assert_eq!(account, "test-account");
+        }
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        cleanup(controller, server);
+    }
+
+    #[tokio::test]
+    async fn logout_cannot_be_undone_by_an_in_flight_refresh() {
+        let (controller, mock, server) = setup(false).await;
+        let caller = controller.clone();
+        let refresh = tokio::spawn(async move { caller.refresh_if_needed().await });
+        tokio::time::timeout(Duration::from_secs(3), mock.entered.notified())
+            .await
+            .unwrap();
+        let caller = controller.clone();
+        let logout = tokio::spawn(async move { caller.logout().await });
+        tokio::task::yield_now().await;
+        mock.release.notify_one();
+        refresh.await.unwrap().unwrap();
+        logout.await.unwrap().unwrap();
+        assert!(controller.read_tokens().await.unwrap().is_none());
+        assert!(!controller.status().await.authorized);
+        cleanup(controller, server);
+    }
+
+    #[tokio::test]
+    async fn cancelled_device_flow_cannot_restore_tokens() {
+        let (controller, mock, server) = setup(true).await;
+        let id = uuid::Uuid::new_v4();
+        controller.0.state.lock().await.pending = Some(Pending {
+            id,
+            user_code: "test-user-code".into(),
+            expires_at: now() + 30,
+        });
+        let inner = Arc::clone(&controller.0);
+        let poll = tokio::spawn(poll_device_flow(
+            inner,
+            "test-auth-id".into(),
+            Pending {
+                id,
+                user_code: "test-user-code".into(),
+                expires_at: now() + 30,
+            },
+            0,
+        ));
+        tokio::time::timeout(Duration::from_secs(3), mock.entered.notified())
+            .await
+            .unwrap();
+        controller.logout().await.unwrap();
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(4), poll)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(controller.read_tokens().await.unwrap().is_none());
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+        cleanup(controller, server);
     }
 }

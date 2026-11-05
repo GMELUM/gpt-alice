@@ -12,11 +12,17 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::watch;
 
 mod audio;
+mod buttons;
+mod command;
 mod indicators;
+#[cfg(any(target_os = "linux", test))]
+mod logging;
 mod mixer;
 mod oauth;
 mod runtime;
 mod scheduler;
+mod storage;
+mod telegram;
 mod training;
 mod user_context;
 mod voice;
@@ -25,7 +31,7 @@ mod web_search;
 
 use audio::AudioController;
 use indicators::{ActionResult, IndicatorController, IndicatorStatus};
-use runtime::{RuntimeController, RuntimeStatus, TimeSettings, TimeStatus};
+use runtime::{RuntimeController, RuntimeStatus, TimeSettingsUpdate};
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:80";
 
@@ -191,21 +197,25 @@ async fn audio_test(State(controller): State<Arc<RuntimeController>>) -> impl In
     }
 }
 
-async fn time_status(State(controller): State<Arc<RuntimeController>>) -> Json<TimeStatus> {
-    Json(controller.time_status())
+async fn time_status(State(controller): State<Arc<RuntimeController>>) -> impl IntoResponse {
+    match tokio::task::spawn_blocking(move || controller.time_status()).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 async fn update_time_settings(
     State(controller): State<Arc<RuntimeController>>,
-    payload: Result<Json<TimeSettings>, JsonRejection>,
+    payload: Result<Json<TimeSettingsUpdate>, JsonRejection>,
 ) -> impl IntoResponse {
     let payload = match payload {
         Ok(Json(payload)) => payload,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error.body_text()),
     };
-    match controller.update_time_settings(payload) {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(error) => api_error(StatusCode::BAD_REQUEST, error),
+    match tokio::task::spawn_blocking(move || controller.update_time_settings(payload)).await {
+        Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, error),
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
 
@@ -235,79 +245,134 @@ fn api_error(status: StatusCode, message: String) -> axum::response::Response {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    logging::init()?;
     let address = env::var("GPT_ALICE_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_ADDRESS.to_owned());
     let address: SocketAddr = address.parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let oauth = oauth::OAuthController::new_near_executable().map_err(std::io::Error::other)?;
+    let directory = env::var_os("GPT_ALICE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(
+            env::current_exe()?
+                .parent()
+                .ok_or("Нет каталога приложения")?
+                .to_path_buf(),
+        );
+    let storage = storage::Storage::open(&directory).map_err(std::io::Error::other)?;
+    let telegram =
+        telegram::TelegramController::new(storage.clone()).map_err(std::io::Error::other)?;
+    let oauth =
+        oauth::OAuthController::new(storage.clone(), &directory).map_err(std::io::Error::other)?;
     let oauth_refresh = oauth.clone();
     tokio::spawn(async move {
         oauth_refresh.refresh_loop().await;
     });
     let indicators = Arc::new(IndicatorController::new());
     let mixer = Arc::new(mixer::AudioMixer::start().map_err(std::io::Error::other)?);
-    let user_context = user_context::UserContextController::new_near_executable();
-    let runtime = Arc::new(RuntimeController::new(
-        Arc::clone(&indicators),
-        Arc::clone(&mixer),
-    ));
-    let scheduler = scheduler::Scheduler::new();
+    let user_context = user_context::UserContextController::new(storage.clone(), &directory)
+        .map_err(std::io::Error::other)?;
+    let runtime = Arc::new(
+        RuntimeController::new(
+            Arc::clone(&indicators),
+            Arc::clone(&mixer),
+            storage.clone(),
+            &directory,
+        )
+        .map_err(std::io::Error::other)?,
+    );
+    let scheduler =
+        scheduler::Scheduler::new(storage.clone(), &directory).map_err(std::io::Error::other)?;
     let audio = AudioController::new(Arc::clone(&mixer));
     let voice = voice::VoiceController::new(
         indicators,
         Arc::clone(&runtime),
         scheduler.clone(),
         user_context.clone(),
+        telegram.clone(),
     )
     .map_err(std::io::Error::other)?;
     scheduler.start(Arc::clone(&runtime), voice.clone());
-    let wakeword = WakeWordController::new();
-    let vpn = vpn::VpnController::new();
+    let wakeword = WakeWordController::new(storage.clone()).map_err(std::io::Error::other)?;
+    let vpn = vpn::VpnController::new(storage.clone()).map_err(std::io::Error::other)?;
     let training_recorder = training::DeviceRecorder::default();
-    let voice_button = voice.clone();
-    let oauth_button = oauth.clone();
-    let button_training_recorder = training_recorder.clone();
-    let button_runtime = tokio::runtime::Handle::current();
-    let volume_runtime = Arc::clone(&runtime);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+    let input_runtime = Arc::clone(&runtime);
     runtime.on_button(move |event| {
-        let volume_changed = volume_runtime.handle_volume_button(&event);
-        let center_pressed = matches!(
-            &event,
-            runtime::DeviceEvent::Touch {
-                button,
-                action,
-                ..
-            } if button == "center" && action == "pressed"
-        );
-        if center_pressed {
-            let voice = voice_button.clone();
-            let oauth = oauth_button.clone();
-            let training_recorder = button_training_recorder.clone();
-            button_runtime.spawn(async move {
-                voice.log("физическая центральная кнопка нажата").await;
-                if training_recorder.is_active().await {
-                    voice
-                        .log("звонок не запущен: микрофон занят записью обучающего примера")
-                        .await;
+        let _ = input_tx.send((
+            event,
+            std::time::Instant::now(),
+            input_runtime.bluetooth_connected(),
+        ));
+    });
+    let gesture_runtime = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        let mut gestures = buttons::Gestures::default();
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let actions = tokio::select! {
+                biased;
+                input = input_rx.recv() => {
+                    let Some((event, now, connected)) = input else { break; };
+                    gestures.push(event, now, connected)
+                }
+                _ = tick.tick() => gestures.expire(std::time::Instant::now(), gesture_runtime.bluetooth_connected()),
+            };
+            for action in actions {
+                if action_tx.send(action).is_err() {
                     return;
                 }
-                if let Err(error) = voice.toggle(&oauth).await {
-                    eprintln!("voice call button failed: {error}");
-                }
-            });
-        } else {
-            let should_play_sfx = AudioController::should_play_button(&event, volume_changed);
-            if should_play_sfx {
-                let voice = voice_button.clone();
-                let audio = audio.clone();
-                button_runtime.spawn(async move {
-                    if voice.audio_is_owned().await {
-                        if let Err(error) = voice.play_sfx().await {
-                            eprintln!("shared call SFX failed: {error}");
-                        }
-                    } else {
-                        audio.handle_button(&event, volume_changed);
+            }
+        }
+    });
+    let button_voice = voice.clone();
+    let button_oauth = oauth.clone();
+    let button_training = training_recorder.clone();
+    let button_runtime = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        while let Some(action) = action_rx.recv().await {
+            match action {
+                buttons::Action::Playback(command) => {
+                    // Never fall back to starting the agent after BT disconnects.
+                    if !button_runtime.bluetooth_connected() {
+                        continue;
                     }
-                });
+                    let runtime = Arc::clone(&button_runtime);
+                    match tokio::task::spawn_blocking(move || runtime.bluetooth_playback(command))
+                        .await
+                    {
+                        Ok(Ok(_)) => audio.request_sfx(),
+                        Ok(Err(error)) => eprintln!("Bluetooth button command failed: {error}"),
+                        Err(error) => eprintln!("Bluetooth button worker failed: {error}"),
+                    }
+                }
+                buttons::Action::Button(event) => {
+                    let center = matches!(&event,
+                        runtime::DeviceEvent::Touch { button, action, .. } | runtime::DeviceEvent::Button { button, action, .. }
+                        if button == "center" && action == "pressed");
+                    if center {
+                        let voice = button_voice.clone();
+                        let oauth = button_oauth.clone();
+                        let training = button_training.clone();
+                        tokio::spawn(async move {
+                            if training.is_active().await {
+                                return;
+                            }
+                            if let Err(error) = voice.toggle(&oauth).await {
+                                eprintln!("voice call button failed: {error}");
+                            }
+                        });
+                    } else {
+                        let runtime = Arc::clone(&button_runtime);
+                        let audio = audio.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let changed = runtime.handle_volume_button(&event);
+                            audio.handle_button(&event, changed);
+                        })
+                        .await;
+                    }
+                }
             }
         }
     });
@@ -353,6 +418,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/vpn/config", post(vpn::replace_config))
         .route("/api/time", get(time_status).post(update_time_settings))
         .route("/api/display/face", post(show_face))
+        .route(
+            "/api/telegram",
+            get(telegram::get_status)
+                .post(telegram::update_config)
+                .delete(telegram::clear_config),
+        )
+        .route("/api/telegram/test", post(telegram::send_test))
         .route("/api/auth/status", get(oauth::get_status))
         .route("/api/auth/start", post(oauth::begin))
         .route("/api/auth/logout", post(oauth::logout))
@@ -380,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(axum::Extension(wakeword))
         .layer(axum::Extension(vpn))
         .layer(axum::Extension(oauth))
+        .layer(axum::Extension(telegram))
         .with_state(runtime);
     axum::serve(listener, app).await?;
     Ok(())
@@ -432,7 +505,7 @@ async fn toggle_voice(
 #[derive(Clone)]
 struct WakeWordController {
     directory: PathBuf,
-    settings_path: PathBuf,
+    storage: storage::Storage,
     changes: watch::Sender<WakeWordSettings>,
 }
 
@@ -453,7 +526,7 @@ impl Default for WakeWordSettings {
 }
 
 impl WakeWordController {
-    fn new() -> Self {
+    fn new(storage: storage::Storage) -> Result<Self, String> {
         let helper = env::var_os("GPT_ALICE_LIVE_HOST")
             .map(PathBuf::from)
             .or_else(|| {
@@ -464,17 +537,19 @@ impl WakeWordController {
         let directory = helper
             .and_then(|path| path.parent().map(|dir| dir.join("wakeword")))
             .unwrap_or_else(|| PathBuf::from("wakeword"));
-        let settings_path = directory.join("settings.json");
-        let settings = std::fs::read(&settings_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<WakeWordSettings>(&bytes).ok())
+        storage.import_json::<WakeWordSettings>("wakeword", &directory.join("settings.json"))?;
+        let settings = storage
+            .get::<WakeWordSettings>("wakeword")?
             .unwrap_or_default();
-        let (changes, _) = watch::channel(settings);
-        Self {
-            directory,
-            settings_path,
-            changes,
+        if !settings.threshold.is_finite() || !(0.0..=1.0).contains(&settings.threshold) {
+            return Err("Некорректный порог wake-word".into());
         }
+        let (changes, _) = watch::channel(settings);
+        Ok(Self {
+            directory,
+            storage,
+            changes,
+        })
     }
 
     fn subscribe(&self) -> watch::Receiver<WakeWordSettings> {
@@ -507,13 +582,7 @@ impl WakeWordController {
         }
         let mut settings = *self.changes.borrow();
         settings.enabled = enabled;
-        let bytes = serde_json::to_vec_pretty(&settings)
-            .map_err(|error| format!("Не удалось сериализовать настройки триггера: {error}"))?;
-        let temporary = self.settings_path.with_extension("json.tmp");
-        std::fs::write(&temporary, bytes)
-            .map_err(|error| format!("Не удалось записать настройки триггера: {error}"))?;
-        std::fs::rename(&temporary, &self.settings_path)
-            .map_err(|error| format!("Не удалось сохранить настройки триггера: {error}"))?;
+        self.storage.set("wakeword", &settings)?;
         self.changes.send_replace(settings);
         Ok(self.status())
     }

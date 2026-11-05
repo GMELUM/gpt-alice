@@ -6,6 +6,9 @@ auth.json
 config.json
 schedules.json
 conversation_context.json
+telegram.json
+state.sqlite*
+storage.key
 .env
 .env.*
 !.env.example

@@ -22,10 +22,12 @@ const SERVICE: &str = "/etc/init.d/S50awg0";
 const CONFIG: &str = "/data/opt/gpt-alice/tools/awg0.conf";
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const ROUTE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct VpnController {
     operation_lock: Arc<Mutex<()>>,
+    storage: crate::storage::Storage,
 }
 
 #[derive(Serialize)]
@@ -55,10 +57,18 @@ pub struct VpnActionResult {
 }
 
 impl VpnController {
-    pub fn new() -> Self {
-        Self {
-            operation_lock: Arc::new(Mutex::new(())),
+    pub fn new(storage: crate::storage::Storage) -> Result<Self, String> {
+        storage.import_text("vpn", Path::new(CONFIG), false)?;
+        storage.import_text("vpn_previous", &backup_path(Path::new(CONFIG)), true)?;
+        if let Some(config) = storage.get::<String>("vpn")? {
+            validate_config(&config)?;
+            atomic_write(Path::new(CONFIG), config.as_bytes())?;
         }
+        start_route_watchdog();
+        Ok(Self {
+            operation_lock: Arc::new(Mutex::new(())),
+            storage,
+        })
     }
 
     pub fn status(&self) -> VpnStatus {
@@ -153,13 +163,18 @@ impl VpnController {
         validate_config(&config)?;
 
         let config_path = PathBuf::from(CONFIG);
-        let previous = fs::read(&config_path).ok();
+        let previous = self.storage.get::<String>("vpn")?;
         let was_enabled = self.status().enabled;
 
-        if let Some(previous_config) = &previous {
-            atomic_write(&backup_path(&config_path), previous_config)?;
-        }
         atomic_write(&config_path, config.as_bytes())?;
+        if let Err(error) = self.storage.set("vpn", &config) {
+            if let Some(previous) = &previous {
+                atomic_write(&config_path, previous.as_bytes())?;
+            } else {
+                let _ = fs::remove_file(&config_path);
+            }
+            return Err(error);
+        }
 
         if !was_enabled {
             return Ok(VpnActionResult {
@@ -177,7 +192,10 @@ impl VpnController {
 
         match previous {
             Some(previous_config) => {
-                let restore_result = atomic_write(&config_path, &previous_config);
+                let restore_result = self
+                    .storage
+                    .set("vpn", &previous_config)
+                    .and_then(|()| atomic_write(&config_path, previous_config.as_bytes()));
                 let restart_result = run_service("restart");
                 if restore_result.is_ok() && restart_result.is_ok() {
                     Err(
@@ -189,6 +207,7 @@ impl VpnController {
                 }
             }
             None => {
+                self.storage.delete("vpn")?;
                 let _ = fs::remove_file(&config_path);
                 let _ = run_service("stop");
                 Err("Новая конфигурация не подключилась и была удалена".to_owned())
@@ -213,6 +232,97 @@ impl VpnController {
             return Err("Управление VPN доступно только на колонке".to_owned());
         }
         Ok(())
+    }
+}
+
+fn start_route_watchdog() {
+    let _ = thread::Builder::new()
+        .name("vpn-endpoint-route".to_owned())
+        .spawn(|| {
+            loop {
+                match repair_endpoint_route() {
+                    Ok(true) => eprintln!("VPN: восстановлен маршрут до endpoint через Wi-Fi"),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("VPN route watchdog: {error}"),
+                }
+                thread::sleep(ROUTE_WATCHDOG_INTERVAL);
+            }
+        });
+}
+
+fn repair_endpoint_route() -> Result<bool, String> {
+    if !Path::new(CONFIG).is_file() || !Path::new(SERVICE).is_file() {
+        return Ok(false);
+    }
+
+    let status = Command::new(SERVICE)
+        .arg("status")
+        .output()
+        .map_err(|error| format!("не удалось прочитать состояние VPN: {error}"))?;
+    if !status.status.success()
+        || !String::from_utf8_lossy(&status.stdout).contains("AmneziaWG awg0 is up")
+    {
+        return Ok(false);
+    }
+
+    let config = fs::read_to_string(CONFIG)
+        .map_err(|error| format!("не удалось прочитать конфигурацию VPN: {error}"))?;
+    let endpoint = endpoint_address(&config)
+        .ok_or_else(|| "в конфигурации VPN не найден IPv4 endpoint".to_owned())?;
+
+    let routes = Command::new("ip")
+        .args(["route", "show"])
+        .output()
+        .map_err(|error| format!("не удалось прочитать маршруты: {error}"))?;
+    if !routes.status.success() {
+        return Err("не удалось прочитать маршруты".to_owned());
+    }
+    let route_text = String::from_utf8_lossy(&routes.stdout);
+    let wifi_route = route_text.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.first() != Some(&"default") {
+            return None;
+        }
+        let device_index = fields.iter().position(|field| *field == "dev")?;
+        if fields.get(device_index + 1) != Some(&"wlan0") {
+            return None;
+        }
+        let gateway_index = fields.iter().position(|field| *field == "via")?;
+        Some((fields.get(gateway_index + 1)?.to_string(), "wlan0"))
+    });
+    let Some((gateway, device)) = wifi_route else {
+        return Ok(false);
+    };
+
+    let route = Command::new("ip")
+        .args(["route", "get", &endpoint.to_string()])
+        .output()
+        .map_err(|error| format!("не удалось проверить маршрут VPN: {error}"))?;
+    let route_text = String::from_utf8_lossy(&route.stdout);
+    if route.status.success() && route_text.contains(&format!("via {gateway} dev {device}")) {
+        return Ok(false);
+    }
+
+    let destination = format!("{endpoint}/32");
+    let output = Command::new("ip")
+        .args([
+            "route",
+            "replace",
+            &destination,
+            "via",
+            &gateway,
+            "dev",
+            device,
+        ])
+        .output()
+        .map_err(|error| format!("не удалось восстановить маршрут VPN: {error}"))?;
+    if output.status.success() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "не удалось восстановить маршрут VPN: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -305,6 +415,32 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     result
 }
 
+fn config_lines(config: &str) -> impl Iterator<Item = &str> {
+    config
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .filter(|line| !line.is_empty() && !line.starts_with(';'))
+}
+
+fn endpoint_address(config: &str) -> Option<Ipv4Addr> {
+    let mut peer = false;
+    for line in config_lines(config) {
+        if line.starts_with('[') && line.ends_with(']') {
+            peer = line == "[Peer]";
+        } else if peer
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("Endpoint")
+        {
+            return value
+                .trim()
+                .parse::<SocketAddrV4>()
+                .ok()
+                .map(|address| *address.ip());
+        }
+    }
+    None
+}
+
 fn validate_config(config: &str) -> Result<(), String> {
     if config.len() > MAX_CONFIG_BYTES {
         return Err("Конфигурация слишком большая (максимум 16 КБ)".to_owned());
@@ -319,11 +455,7 @@ fn validate_config(config: &str) -> Result<(), String> {
     let mut interface_count = 0;
     let mut peer_count = 0;
 
-    for line in config.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
+    for line in config_lines(config) {
         if line.starts_with('[') && line.ends_with(']') {
             section = &line[1..line.len() - 1];
             match section {
@@ -413,4 +545,19 @@ fn validate_config(config: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_accepts_comments_allowed_by_config_validation() {
+        let key = STANDARD.encode([0u8; 32]);
+        let config = format!(
+            "[Interface]\nPrivateKey = {key}\nHeaderProtectionKey = {key}\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {key}\nAllowedIPs = 0.0.0.0/0\n; Endpoint = 198.51.100.99:1234\nEndpoint = 192.0.2.1:51820 # server\n"
+        );
+        validate_config(&config).unwrap();
+        assert_eq!(endpoint_address(&config), Some(Ipv4Addr::new(192, 0, 2, 1)));
+    }
 }
